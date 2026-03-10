@@ -1,0 +1,3 @@
+ALTER TABLE "UserSettings"
+ADD COLUMN "muted" BOOLEAN NOT NULL DEFAULT false;
+
