@@ -55,6 +55,25 @@ const buildDayKey = (value: Date): string => {
   return `${year}-${month}-${day}`;
 };
 
+const dedupeSyncHistoryEntries = <T extends { trackId: string; listenedAt: string; dayKey: string }>(
+  entries: T[],
+) => {
+  const deduped = new Map<string, T>();
+
+  entries.forEach((entry) => {
+    const key = `${entry.trackId}:${entry.dayKey}`;
+    const existing = deduped.get(key);
+
+    if (!existing || Date.parse(entry.listenedAt) > Date.parse(existing.listenedAt)) {
+      deduped.set(key, entry);
+    }
+  });
+
+  return [...deduped.values()].sort(
+    (left, right) => Date.parse(right.listenedAt) - Date.parse(left.listenedAt),
+  );
+};
+
 export const historyRoutes: FastifyPluginAsync = async (app) => {
   const createHistoryEvent = async (
     userId: string,
@@ -169,13 +188,22 @@ export const historyRoutes: FastifyPluginAsync = async (app) => {
         request.query as { limit?: number; offset?: number },
       );
 
+      const items = dedupeSyncHistoryEntries(
+        response.items.map((item) => {
+          const trackId = toExternalTrackId(item.track);
+          const dayKey = buildDayKey(item.createdAt);
+
+          return {
+            id: `${trackId}:${dayKey}`,
+            trackId,
+            listenedAt: item.createdAt.toISOString(),
+            dayKey,
+          };
+        }),
+      );
+
       return {
-        items: response.items.map((item) => ({
-          id: item.id,
-          trackId: toExternalTrackId(item.track),
-          listenedAt: item.createdAt.toISOString(),
-          dayKey: buildDayKey(item.createdAt),
-        })),
+        items,
       };
     },
   );
@@ -225,7 +253,7 @@ export const historyRoutes: FastifyPluginAsync = async (app) => {
 
       return reply.code(201).send({
         event: {
-          id: event.id,
+          id: `${body.trackId}:${buildDayKey(listenedAt)}`,
           trackId: body.trackId,
           listenedAt: listenedAt.toISOString(),
           dayKey: buildDayKey(listenedAt),
@@ -262,9 +290,20 @@ export const historyRoutes: FastifyPluginAsync = async (app) => {
         }))
         .filter((entry) => entry.trackId);
 
+      const dedupedEntries = dedupeSyncHistoryEntries(
+        normalizedEntries.map((entry) => ({
+          ...entry,
+          listenedAt: entry.listenedAt.toISOString(),
+          dayKey: buildDayKey(entry.listenedAt),
+        })),
+      ).map((entry) => ({
+        trackId: entry.trackId,
+        listenedAt: new Date(entry.listenedAt),
+      }));
+
       const trackMap = await ensureSyncTracks(
         app.prisma,
-        normalizedEntries.map((entry) => entry.trackId),
+        dedupedEntries.map((entry) => entry.trackId),
       );
 
       await app.prisma.$transaction(async (tx) => {
@@ -274,7 +313,7 @@ export const historyRoutes: FastifyPluginAsync = async (app) => {
           },
         });
 
-        if (!normalizedEntries.length) {
+        if (!dedupedEntries.length) {
           return;
         }
 
@@ -283,7 +322,7 @@ export const historyRoutes: FastifyPluginAsync = async (app) => {
           trackId: string;
           eventType: HistoryEventType;
           createdAt: Date;
-        }> = normalizedEntries.flatMap((entry) => {
+        }> = dedupedEntries.flatMap((entry) => {
           const track = trackMap.get(entry.trackId);
 
           if (!track) {
