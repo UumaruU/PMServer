@@ -21,20 +21,32 @@ enum HistoryEventType {
   SKIPPED
 }
 
+enum RecommendationEventType {
+  PLAYBACK
+  FAVORITE
+  PLAYLIST
+  DISLIKE
+}
+
 model User {
-  id            String             @id @default(uuid()) @db.Uuid
-  email         String             @unique
-  passwordHash  String
-  username      String?
-  displayName   String?
-  avatarUrl     String?
-  createdAt     DateTime           @default(now())
-  updatedAt     DateTime           @updatedAt
-  refreshTokens RefreshToken[]
-  favorites     Favorite[]
-  playlists     Playlist[]
-  settings      UserSettings?
-  historyEvents UserHistoryEvent[]
+  id                     String                      @id @default(uuid()) @db.Uuid
+  login                  String                      @unique
+  email                  String                      @unique
+  passwordHash           String
+  username               String?
+  displayName            String?
+  avatarUrl              String?
+  createdAt              DateTime                    @default(now())
+  updatedAt              DateTime                    @updatedAt
+  refreshTokens          RefreshToken[]
+  favorites              Favorite[]
+  playlists              Playlist[]
+  settings               UserSettings?
+  historyEvents          UserHistoryEvent[]
+  searchHistoryEntries   UserSearchHistoryEntry[]
+  recommendationProfile  UserRecommendationProfile?
+  recommendationCache    UserRecommendationCacheEntry[]
+  recommendationEvents   UserRecommendationEvent[]
 }
 
 model RefreshToken {
@@ -52,6 +64,7 @@ model RefreshToken {
 
 model Track {
   id                     String             @id @default(uuid()) @db.Uuid
+  clientTrackId          String?            @unique
   source                 String
   sourceTrackId          String
   title                  String
@@ -68,6 +81,7 @@ model Track {
   favorites              Favorite[]
   playlistTracks         PlaylistTrack[]
   historyEvents          UserHistoryEvent[]
+  recommendationEvents   UserRecommendationEvent[]
 
   @@unique([source, sourceTrackId])
 }
@@ -133,4 +147,54 @@ model UserHistoryEvent {
   track      Track            @relation(fields: [trackId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
+}
+
+model UserSearchHistoryEntry {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @db.Uuid
+  query      String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model UserRecommendationProfile {
+  userId           String   @id @db.Uuid
+  longTermProfile  Json
+  sessionProfile   Json
+  entityProfile    Json
+  profileRevision  Int      @default(1)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model UserRecommendationCacheEntry {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @db.Uuid
+  cacheKey   String
+  payload    Json
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  expiresAt  DateTime?
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, cacheKey])
+  @@index([userId])
+}
+
+model UserRecommendationEvent {
+  id         String                  @id @default(uuid()) @db.Uuid
+  userId     String                  @db.Uuid
+  trackId    String?                 @db.Uuid
+  eventType  RecommendationEventType
+  payload    Json
+  createdAt  DateTime                @default(now())
+  user       User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  track      Track?                  @relation(fields: [trackId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([trackId])
 }

@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
 import { Prisma } from "@prisma/client";
 
+import { serializeTrackForClient } from "../tracks/serializers";
 import { AppError } from "../utils/errors";
 import { ensureSyncTracks, ensureTrackExists, toExternalTrackId } from "../tracks/service";
 
@@ -143,6 +144,7 @@ export const favoritesRoutes: FastifyPluginAsync = async (app) => {
 
       return {
         favorites: favorites.map((favorite) => toExternalTrackId(favorite.track)),
+        tracks: favorites.map((favorite) => serializeTrackForClient(favorite.track, { isFavorite: true })),
       };
     },
   );

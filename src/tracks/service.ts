@@ -25,8 +25,182 @@ export const ensureTrackExists = async (prisma: DbClient, trackId: string): Prom
   return track;
 };
 
-export const toExternalTrackId = (track: Pick<Track, "id" | "source" | "sourceTrackId">): string =>
-  track.source === SYNC_TRACK_SOURCE ? track.sourceTrackId : track.id;
+function normalizeRequired(value: string, code: string, message: string) {
+  const normalized = value.trim();
+
+  if (!normalized) {
+    throw new AppError(400, code, message);
+  }
+
+  return normalized;
+}
+
+function normalizeOptional(value?: string | null) {
+  const normalized = value?.trim();
+  return normalized ? normalized : null;
+}
+
+export function buildClientTrackId(input: {
+  clientTrackId?: string | null;
+  source: string;
+  sourceTrackId: string;
+}) {
+  return normalizeOptional(input.clientTrackId) ?? `${input.source}:${input.sourceTrackId}`;
+}
+
+export function getProviderIdForClientTrack(track: { clientTrackId?: string | null; source: string }) {
+  if (track.source && track.source !== SYNC_TRACK_SOURCE) {
+    return track.source;
+  }
+
+  const clientTrackId = normalizeOptional(track.clientTrackId);
+  if (!clientTrackId || !clientTrackId.includes(":")) {
+    return "hitmos";
+  }
+
+  return clientTrackId.split(":")[0] || "hitmos";
+}
+
+export function getProviderTrackIdForClientTrack(
+  track: { clientTrackId?: string | null; sourceTrackId: string },
+) {
+  const clientTrackId = normalizeOptional(track.clientTrackId);
+
+  if (clientTrackId && clientTrackId.includes(":")) {
+    return clientTrackId.slice(clientTrackId.indexOf(":") + 1) || track.sourceTrackId;
+  }
+
+  return track.sourceTrackId;
+}
+
+export const toExternalTrackId = (
+  track: { clientTrackId?: string | null; source: string; sourceTrackId: string },
+): string => normalizeOptional(track.clientTrackId) ?? (track.source === SYNC_TRACK_SOURCE ? track.sourceTrackId : `${track.source}:${track.sourceTrackId}`);
+
+export interface ResolvedTrackInput {
+  clientTrackId?: string | null;
+  source: string;
+  sourceTrackId: string;
+  title: string;
+  artistName: string;
+  albumTitle?: string | null;
+  duration?: number | null;
+  coverUrl?: string | null;
+  audioUrl?: string | null;
+  musicBrainzRecordingId?: string | null;
+  musicBrainzArtistId?: string | null;
+  musicBrainzReleaseId?: string | null;
+}
+
+function toResolvedTrackData(input: ResolvedTrackInput) {
+  const source = normalizeRequired(input.source, "INVALID_TRACK_SOURCE", "Track source is required.");
+  const sourceTrackId = normalizeRequired(
+    input.sourceTrackId,
+    "INVALID_SOURCE_TRACK_ID",
+    "Track source ID is required.",
+  );
+  const title = normalizeRequired(input.title, "INVALID_TRACK_TITLE", "Track title is required.");
+  const artistName = normalizeRequired(
+    input.artistName,
+    "INVALID_TRACK_ARTIST",
+    "Track artist is required.",
+  );
+
+  return {
+    clientTrackId: buildClientTrackId({
+      clientTrackId: input.clientTrackId,
+      source,
+      sourceTrackId,
+    }),
+    source,
+    sourceTrackId,
+    title,
+    artistName,
+    albumTitle: normalizeOptional(input.albumTitle),
+    duration: typeof input.duration === "number" && Number.isFinite(input.duration) ? Math.max(0, Math.round(input.duration)) : null,
+    coverUrl: normalizeOptional(input.coverUrl),
+    audioUrl: normalizeOptional(input.audioUrl),
+    musicBrainzRecordingId: normalizeOptional(input.musicBrainzRecordingId),
+    musicBrainzArtistId: normalizeOptional(input.musicBrainzArtistId),
+    musicBrainzReleaseId: normalizeOptional(input.musicBrainzReleaseId),
+  };
+}
+
+export async function upsertResolvedTrack(prisma: DbClient, input: ResolvedTrackInput): Promise<Track> {
+  const data = toResolvedTrackData(input);
+  const existingByClientTrackId = data.clientTrackId
+    ? await prisma.track.findUnique({
+        where: {
+          clientTrackId: data.clientTrackId,
+        },
+      })
+    : null;
+
+  if (existingByClientTrackId) {
+    return prisma.track.update({
+      where: {
+        id: existingByClientTrackId.id,
+      },
+      data,
+    });
+  }
+
+  const existingBySource = await prisma.track.findUnique({
+    where: {
+      source_sourceTrackId: {
+        source: data.source,
+        sourceTrackId: data.sourceTrackId,
+      },
+    },
+  });
+
+  if (existingBySource) {
+    return prisma.track.update({
+      where: {
+        id: existingBySource.id,
+      },
+      data,
+    });
+  }
+
+  return prisma.track.create({
+    data,
+  });
+}
+
+export async function upsertResolvedTracks(
+  prisma: DbClient,
+  tracks: ResolvedTrackInput[],
+): Promise<Track[]> {
+  const uniqueTracks = new Map<string, ResolvedTrackInput>();
+
+  tracks.forEach((track) => {
+    const source = track.source?.trim();
+    const sourceTrackId = track.sourceTrackId?.trim();
+
+    if (!source || !sourceTrackId) {
+      return;
+    }
+
+    const key = buildClientTrackId({
+      clientTrackId: track.clientTrackId,
+      source,
+      sourceTrackId,
+    });
+
+    uniqueTracks.set(key, {
+      ...track,
+      source,
+      sourceTrackId,
+    });
+  });
+
+  const results: Track[] = [];
+  for (const track of uniqueTracks.values()) {
+    results.push(await upsertResolvedTrack(prisma, track));
+  }
+  return results;
+}
 
 export const ensureSyncTrack = async (
   prisma: DbClient,
@@ -52,12 +226,10 @@ export const ensureSyncTrack = async (
 
   return prisma.track.upsert({
     where: {
-      source_sourceTrackId: {
-        source: SYNC_TRACK_SOURCE,
-        sourceTrackId: normalizedTrackId,
-      },
+      clientTrackId: normalizedTrackId,
     },
     create: {
+      clientTrackId: normalizedTrackId,
       source: SYNC_TRACK_SOURCE,
       sourceTrackId: normalizedTrackId,
       title: normalizedTrackId,
@@ -70,7 +242,11 @@ export const ensureSyncTrack = async (
       musicBrainzArtistId: null,
       musicBrainzReleaseId: null,
     },
-    update: {},
+    update: {
+      clientTrackId: normalizedTrackId,
+      source: SYNC_TRACK_SOURCE,
+      sourceTrackId: normalizedTrackId,
+    },
   });
 };
 
@@ -84,4 +260,21 @@ export const ensureSyncTracks = async (
   );
 
   return new Map(trackEntries);
+};
+
+export const findTrackByClientTrackId = async (
+  prisma: DbClient,
+  clientTrackId: string,
+): Promise<Track | null> => {
+  const normalizedTrackId = clientTrackId.trim();
+
+  if (!normalizedTrackId) {
+    return null;
+  }
+
+  return prisma.track.findUnique({
+    where: {
+      clientTrackId: normalizedTrackId,
+    },
+  });
 };

@@ -6,16 +6,15 @@ export const registerAuthDecorator = (app: FastifyInstance): void => {
   app.decorateRequest("authUser", null);
   app.decorate("authenticate", async (request) => {
     try {
-      const payload = await request.jwtVerify<{ email?: string; sub?: string }>();
+      const payload = await request.jwtVerify<{ sub?: string }>();
       const userId = payload.sub;
 
-      if (!userId || !payload.email) {
+      if (!userId) {
         throw new Error("Missing JWT subject.");
       }
 
       request.authUser = {
         userId,
-        email: payload.email,
       };
     } catch (error) {
       request.log.debug({ err: error }, "Access token verification failed.");
@@ -23,4 +22,3 @@ export const registerAuthDecorator = (app: FastifyInstance): void => {
     }
   });
 };
-

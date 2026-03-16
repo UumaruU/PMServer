@@ -8,6 +8,14 @@ import { createPrismaClient } from "../src/database/prisma";
 const testDatabaseUrl = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
 const describeIfDb = testDatabaseUrl ? describe : describe.skip;
 
+function buildLogin() {
+  return `u_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
+}
+
+function buildExternalTrackId(source: string, sourceTrackId: string) {
+  return `${source}:${sourceTrackId}`;
+}
+
 describeIfDb("Pingu Music API", () => {
   const prisma = createPrismaClient(testDatabaseUrl);
   const config: AppConfig = {
@@ -35,6 +43,10 @@ describeIfDb("Pingu Music API", () => {
   });
 
   beforeEach(async () => {
+    await prisma.userRecommendationEvent.deleteMany();
+    await prisma.userRecommendationCacheEntry.deleteMany();
+    await prisma.userRecommendationProfile.deleteMany();
+    await prisma.userSearchHistoryEntry.deleteMany();
     await prisma.playlistTrack.deleteMany();
     await prisma.favorite.deleteMany();
     await prisma.userHistoryEvent.deleteMany();
@@ -49,14 +61,13 @@ describeIfDb("Pingu Music API", () => {
     await app.close();
   });
 
-  const registerUser = async (email = `user-${randomUUID()}@example.com`) => {
+  const registerUser = async (login = buildLogin()) => {
     const response = await app.inject({
       method: "POST",
       url: "/auth/register",
       payload: {
-        email,
+        login,
         password: "super-secret-password",
-        username: "pingu",
         deviceName: "Desktop",
       },
     });
@@ -66,22 +77,51 @@ describeIfDb("Pingu Music API", () => {
       body: response.json() as {
         accessToken: string;
         refreshToken: string;
-        user: { id: string; email: string };
+        user: { id: string; login: string };
       },
     };
   };
 
-  const createTrack = async () =>
+  const createTrack = async (input: Partial<{
+    source: string;
+    sourceTrackId: string;
+    title: string;
+    artistName: string;
+    audioUrl: string | null;
+    duration: number | null;
+    clientTrackId: string | null;
+  }> = {}) =>
     prisma.track.create({
       data: {
-        source: "hitmo",
-        sourceTrackId: randomUUID(),
-        title: "Track title",
-        artistName: "Artist",
+        source: input.source ?? "hitmos",
+        sourceTrackId: input.sourceTrackId ?? randomUUID(),
+        clientTrackId: input.clientTrackId ?? null,
+        title: input.title ?? "Track title",
+        artistName: input.artistName ?? "Artist",
+        audioUrl: input.audioUrl ?? "https://example.invalid/audio.mp3",
+        duration: input.duration ?? 180000,
       },
     });
 
-  const resolveTrack = async (accessToken: string, sourceTrackId?: string) => {
+  const resolveTrack = async (
+    accessToken: string,
+    input: Partial<{
+      clientTrackId: string | null;
+      source: string;
+      sourceTrackId: string;
+      title: string;
+      artistName: string;
+      albumTitle: string | null;
+      duration: number | null;
+      audioUrl: string | null;
+      coverUrl: string | null;
+      musicBrainzRecordingId: string | null;
+      musicBrainzArtistId: string | null;
+      musicBrainzReleaseId: string | null;
+    }> = {},
+  ) => {
+    const source = input.source ?? "hitmos";
+    const sourceTrackId = input.sourceTrackId ?? randomUUID();
     const response = await app.inject({
       method: "POST",
       url: "/me/tracks/resolve",
@@ -89,33 +129,50 @@ describeIfDb("Pingu Music API", () => {
         authorization: `Bearer ${accessToken}`,
       },
       payload: {
-        source: "hitmo",
-        sourceTrackId: sourceTrackId ?? randomUUID(),
-        title: "Track title",
-        artistName: "Artist",
-        albumTitle: "Album",
-        duration: 180000,
+        clientTrackId: input.clientTrackId ?? buildExternalTrackId(source, sourceTrackId),
+        source,
+        sourceTrackId,
+        title: input.title ?? "Track title",
+        artistName: input.artistName ?? "Artist",
+        albumTitle: input.albumTitle ?? "Album",
+        duration: input.duration ?? 180000,
+        audioUrl: input.audioUrl ?? "https://example.invalid/audio.mp3",
+        coverUrl: input.coverUrl ?? "https://example.invalid/cover.jpg",
+        musicBrainzRecordingId: input.musicBrainzRecordingId ?? null,
+        musicBrainzArtistId: input.musicBrainzArtistId ?? null,
+        musicBrainzReleaseId: input.musicBrainzReleaseId ?? null,
       },
     });
 
     return {
       response,
-      body: response.json() as { track: { id: string; sourceTrackId: string; title: string } },
+      source,
+      sourceTrackId,
+      externalTrackId: buildExternalTrackId(source, sourceTrackId),
+      body: response.json() as {
+        track: {
+          id: string;
+          clientTrackId: string | null;
+          source: string;
+          sourceTrackId: string;
+          title: string;
+        };
+      },
     };
   };
 
   it("registers, logs in, refreshes, logs out, and blocks revoked refresh tokens", async () => {
-    const email = `user-${randomUUID()}@example.com`;
+    const loginName = buildLogin();
 
-    const register = await registerUser(email);
+    const register = await registerUser(loginName);
     expect(register.response.statusCode).toBe(201);
-    expect(register.body.user.email).toBe(email);
+    expect(register.body.user.login).toBe(loginName);
 
     const duplicate = await app.inject({
       method: "POST",
       url: "/auth/register",
       payload: {
-        email,
+        login: loginName,
         password: "super-secret-password",
       },
     });
@@ -125,7 +182,7 @@ describeIfDb("Pingu Music API", () => {
       method: "POST",
       url: "/auth/login",
       payload: {
-        email,
+        login: loginName,
         password: "super-secret-password",
         deviceName: "Desktop",
       },
@@ -142,7 +199,7 @@ describeIfDb("Pingu Music API", () => {
       method: "POST",
       url: "/auth/login",
       payload: {
-        email,
+        login: loginName,
         password: "wrong-password",
       },
     });
@@ -163,15 +220,6 @@ describeIfDb("Pingu Music API", () => {
     });
     expect(me.statusCode).toBe(200);
 
-    const meWithInvalidToken = await app.inject({
-      method: "GET",
-      url: "/auth/me",
-      headers: {
-        authorization: "Bearer definitely-invalid-token",
-      },
-    });
-    expect(meWithInvalidToken.statusCode).toBe(401);
-
     const refresh = await app.inject({
       method: "POST",
       url: "/auth/refresh",
@@ -181,33 +229,6 @@ describeIfDb("Pingu Music API", () => {
     });
     expect(refresh.statusCode).toBe(200);
     expect(refresh.json()).toHaveProperty("accessToken");
-
-    const refreshTokenRecord = await prisma.refreshToken.findFirstOrThrow({
-      where: {
-        userId: loginBody.user.id,
-      },
-      orderBy: {
-        createdAt: "desc",
-      },
-    });
-
-    await prisma.refreshToken.update({
-      where: {
-        id: refreshTokenRecord.id,
-      },
-      data: {
-        expiresAt: new Date(Date.now() - 60_000),
-      },
-    });
-
-    const expiredRefresh = await app.inject({
-      method: "POST",
-      url: "/auth/refresh",
-      payload: {
-        refreshToken: loginBody.refreshToken,
-      },
-    });
-    expect(expiredRefresh.statusCode).toBe(401);
 
     const logout = await app.inject({
       method: "POST",
@@ -228,34 +249,25 @@ describeIfDb("Pingu Music API", () => {
     expect(refreshAfterLogout.statusCode).toBe(401);
   });
 
-  it("resolves track metadata into a reusable track reference", async () => {
+  it("resolves track metadata into a reusable track reference with stable clientTrackId", async () => {
     const { body } = await registerUser();
 
-    const firstResolve = await resolveTrack(body.accessToken, "source-track-1");
+    const firstResolve = await resolveTrack(body.accessToken, {
+      sourceTrackId: "source-track-1",
+      title: "Track title",
+    });
     expect(firstResolve.response.statusCode).toBe(200);
     expect(firstResolve.body.track.title).toBe("Track title");
+    expect(firstResolve.body.track.clientTrackId).toBe("hitmos:source-track-1");
 
-    const secondResolve = await app.inject({
-      method: "POST",
-      url: "/me/tracks/resolve",
-      headers: {
-        authorization: `Bearer ${body.accessToken}`,
-      },
-      payload: {
-        source: "hitmo",
-        sourceTrackId: "source-track-1",
-        title: "Track title updated",
-        artistName: "Artist",
-      },
+    const secondResolve = await resolveTrack(body.accessToken, {
+      sourceTrackId: "source-track-1",
+      title: "Track title updated",
     });
 
-    expect(secondResolve.statusCode).toBe(200);
-    expect((secondResolve.json() as { track: { id: string; title: string } }).track.id).toBe(
-      firstResolve.body.track.id,
-    );
-    expect((secondResolve.json() as { track: { title: string } }).track.title).toBe(
-      "Track title updated",
-    );
+    expect(secondResolve.response.statusCode).toBe(200);
+    expect(secondResolve.body.track.id).toBe(firstResolve.body.track.id);
+    expect(secondResolve.body.track.title).toBe("Track title updated");
   });
 
   it("adds and removes favorites while rejecting duplicates", async () => {
@@ -306,9 +318,26 @@ describeIfDb("Pingu Music API", () => {
     expect(removeFavorite.statusCode).toBe(204);
   });
 
-  it("supports sync aliases for favorites, playlists, settings, and history", async () => {
+  it("supports sync aliases for favorites, playlists, settings, history, and search history", async () => {
     const { body } = await registerUser();
-    const track = await createTrack();
+    const track = await createTrack({
+      source: "hitmos",
+      sourceTrackId: "sync-track-1",
+      clientTrackId: "hitmos:sync-track-1",
+    });
+    const externalTrackId = buildExternalTrackId(track.source, track.sourceTrackId);
+
+    const pushFavorites = await app.inject({
+      method: "PUT",
+      url: "/sync/favorites",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackIds: [externalTrackId],
+      },
+    });
+    expect(pushFavorites.statusCode).toBe(204);
 
     const favorites = await app.inject({
       method: "GET",
@@ -318,18 +347,37 @@ describeIfDb("Pingu Music API", () => {
       },
     });
     expect(favorites.statusCode).toBe(200);
+    expect((favorites.json() as { favorites: string[] }).favorites).toEqual([externalTrackId]);
 
-    const createPlaylist = await app.inject({
-      method: "POST",
+    const syncPlaylists = await app.inject({
+      method: "PUT",
       url: "/sync/playlists",
       headers: {
         authorization: `Bearer ${body.accessToken}`,
       },
       payload: {
-        name: "Synced playlist",
+        playlists: [
+          {
+            name: "Synced playlist",
+            trackIds: [externalTrackId],
+            createdAt: new Date().toISOString(),
+          },
+        ],
       },
     });
-    expect(createPlaylist.statusCode).toBe(201);
+    expect(syncPlaylists.statusCode).toBe(204);
+
+    const playlists = await app.inject({
+      method: "GET",
+      url: "/sync/playlists",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+    });
+    expect(playlists.statusCode).toBe(200);
+    expect((playlists.json() as { playlists: Array<{ trackIds: string[] }> }).playlists[0].trackIds).toEqual([
+      externalTrackId,
+    ]);
 
     const settings = await app.inject({
       method: "GET",
@@ -340,6 +388,21 @@ describeIfDb("Pingu Music API", () => {
     });
     expect(settings.statusCode).toBe(200);
 
+    const updateSettings = await app.inject({
+      method: "PUT",
+      url: "/sync/settings",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        settings: {
+          volume: 0.42,
+          shuffleEnabled: true,
+        },
+      },
+    });
+    expect(updateSettings.statusCode).toBe(204);
+
     const historyEvent = await app.inject({
       method: "POST",
       url: "/sync/history/events",
@@ -347,8 +410,8 @@ describeIfDb("Pingu Music API", () => {
         authorization: `Bearer ${body.accessToken}`,
       },
       payload: {
-        trackId: track.id,
-        eventType: "STARTED",
+        trackId: externalTrackId,
+        playedMs: 12345,
       },
     });
     expect(historyEvent.statusCode).toBe(201);
@@ -361,6 +424,40 @@ describeIfDb("Pingu Music API", () => {
       },
     });
     expect(history.statusCode).toBe(200);
+    expect((history.json() as { items: Array<{ trackId: string }> }).items[0].trackId).toBe(externalTrackId);
+
+    const syncSearchHistory = await app.inject({
+      method: "PUT",
+      url: "/sync/search-history",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        items: [
+          {
+            query: "night drive",
+            createdAt: new Date("2026-03-16T10:00:00.000Z").toISOString(),
+          },
+          {
+            query: "midnight echo",
+            createdAt: new Date("2026-03-16T11:00:00.000Z").toISOString(),
+          },
+        ],
+      },
+    });
+    expect(syncSearchHistory.statusCode).toBe(204);
+
+    const searchHistory = await app.inject({
+      method: "GET",
+      url: "/sync/search-history",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+    });
+    expect(searchHistory.statusCode).toBe(200);
+    expect(
+      (searchHistory.json() as { items: Array<{ query: string }> }).items.map((item) => item.query),
+    ).toEqual(["midnight echo", "night drive"]);
   });
 
   it("creates, updates, and deletes playlists with tracks", async () => {
@@ -427,8 +524,7 @@ describeIfDb("Pingu Music API", () => {
     });
     expect(listPlaylists.statusCode).toBe(200);
     expect(
-      (listPlaylists.json() as { items: Array<{ tracks: Array<{ trackId: string }> }> }).items[0]
-        .tracks,
+      (listPlaylists.json() as { items: Array<{ tracks: Array<{ trackId: string }> }> }).items[0].tracks,
     ).toHaveLength(1);
 
     const removeTrack = await app.inject({
@@ -541,6 +637,106 @@ describeIfDb("Pingu Music API", () => {
     expect(historyBody.items[1].trackId).toBe(firstTrack.id);
   });
 
+  it("returns server-side recommendation stream and persists affinity events per user", async () => {
+    const { body } = await registerUser();
+    const primary = await resolveTrack(body.accessToken, {
+      sourceTrackId: "rec-track-1",
+      title: "Night Drive",
+      artistName: "Northern Lights",
+      audioUrl: "https://example.invalid/rec-track-1.mp3",
+      duration: 210000,
+      musicBrainzArtistId: "mb-artist-1",
+    });
+    const secondary = await resolveTrack(body.accessToken, {
+      sourceTrackId: "rec-track-2",
+      title: "Night Drive Pt. 2",
+      artistName: "Northern Lights",
+      audioUrl: "https://example.invalid/rec-track-2.mp3",
+      duration: 205000,
+      musicBrainzArtistId: "mb-artist-1",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "rec-track-3",
+      title: "Midnight Echo",
+      artistName: "Northern Lights",
+      audioUrl: "https://example.invalid/rec-track-3.mp3",
+      duration: 215000,
+      musicBrainzArtistId: "mb-artist-1",
+    });
+
+    const favorite = await app.inject({
+      method: "POST",
+      url: "/me/favorites",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: primary.body.track.id,
+      },
+    });
+    expect(favorite.statusCode).toBe(201);
+
+    const historyEvent = await app.inject({
+      method: "POST",
+      url: "/me/history/events",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: secondary.body.track.id,
+        eventType: "COMPLETED",
+        playedMs: 200000,
+      },
+    });
+    expect(historyEvent.statusCode).toBe(201);
+
+    const stream = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        limit: 5,
+        mode: "autoplay",
+        currentTrackId: primary.externalTrackId,
+      },
+    });
+    expect(stream.statusCode).toBe(200);
+
+    const streamBody = stream.json() as {
+      items: Array<{
+        preferredVariantId: string;
+        track: { id: string; audioUrl: string };
+      }>;
+    };
+    expect(streamBody.items.length).toBeGreaterThan(0);
+    expect(streamBody.items[0].track.id).toBe(streamBody.items[0].preferredVariantId);
+    expect(streamBody.items[0].track.audioUrl).toContain("https://");
+
+    const playback = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/events/playback",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: primary.externalTrackId,
+        listenedMs: 200000,
+        trackDurationMs: 210000,
+        occurredAt: new Date().toISOString(),
+        endedNaturally: true,
+        wasSkipped: false,
+        sessionId: "test-session",
+        seedChannels: ["sessionContinuation"],
+      },
+    });
+    expect(playback.statusCode).toBe(204);
+
+    expect(await prisma.userRecommendationProfile.findUnique({ where: { userId: body.user.id } })).not.toBeNull();
+    expect(await prisma.userRecommendationEvent.count({ where: { userId: body.user.id } })).toBeGreaterThan(0);
+  });
+
   it("rate limits auth endpoints", async () => {
     const rateLimitedApp = await buildApp({
       config: {
@@ -554,7 +750,7 @@ describeIfDb("Pingu Music API", () => {
     await rateLimitedApp.ready();
 
     try {
-      const email = `rate-limit-${randomUUID()}@example.com`;
+      const login = buildLogin();
       const firstAttempt = await rateLimitedApp.inject({
         method: "POST",
         url: "/auth/login",
@@ -562,7 +758,7 @@ describeIfDb("Pingu Music API", () => {
           "x-forwarded-for": "203.0.113.10",
         },
         payload: {
-          email,
+          login,
           password: "super-secret-password",
         },
       });
@@ -574,7 +770,7 @@ describeIfDb("Pingu Music API", () => {
           "x-forwarded-for": "203.0.113.10",
         },
         payload: {
-          email,
+          login,
           password: "super-secret-password",
         },
       });

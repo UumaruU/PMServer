@@ -9,7 +9,6 @@ type RefreshTokenPayload = {
 
 export type AccessTokenPayload = {
   sub: string;
-  email: string;
 };
 
 export type VerifiedRefreshToken = {
@@ -30,16 +29,10 @@ export const createAccessToken = (
   config: AppConfig,
   payload: AccessTokenPayload,
 ): string =>
-  jwt.sign(
-    {
-      email: payload.email,
-    },
-    config.jwtAccessSecret,
-    {
-      subject: payload.sub,
-      expiresIn: config.jwtAccessExpiresIn as SignOptions["expiresIn"],
-    },
-  );
+  jwt.sign({}, config.jwtAccessSecret, {
+    subject: payload.sub,
+    expiresIn: config.jwtAccessExpiresIn as SignOptions["expiresIn"],
+  });
 
 export const createRefreshToken = (
   config: AppConfig,

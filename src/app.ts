@@ -12,6 +12,8 @@ import { favoritesRoutes } from "./favorites/routes";
 import { historyRoutes } from "./history/routes";
 import { playlistsRoutes } from "./playlists/routes";
 import { registerAuthDecorator } from "./plugins/auth";
+import { recommendationsRoutes } from "./recommendations/routes";
+import { searchHistoryRoutes } from "./search-history/routes";
 import { settingsRoutes } from "./settings/routes";
 import { tracksRoutes } from "./tracks/routes";
 import { AppError } from "./utils/errors";
@@ -71,7 +73,9 @@ export const buildApp = async (options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(playlistsRoutes);
   await app.register(settingsRoutes);
   await app.register(historyRoutes);
+  await app.register(searchHistoryRoutes);
   await app.register(tracksRoutes);
+  await app.register(recommendationsRoutes);
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof AppError) {

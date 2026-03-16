@@ -20,20 +20,20 @@ type AuthTokens = {
 export const createUser = async (
   prisma: PrismaClient,
   input: {
-    email: string;
+    login: string;
     password: string;
-    username?: string;
     name?: string;
   },
 ): Promise<User> => {
+  const normalizedLogin = input.login.trim();
   const existingUser = await prisma.user.findUnique({
     where: {
-      email: input.email,
+      login: normalizedLogin,
     },
   });
 
   if (existingUser) {
-    throw new AppError(409, "EMAIL_ALREADY_EXISTS", "Email is already registered.");
+    throw new AppError(409, "LOGIN_ALREADY_EXISTS", "Login is already registered.");
   }
 
   const passwordHash = await hashValue(input.password);
@@ -41,10 +41,11 @@ export const createUser = async (
   return prisma.$transaction(async (tx) => {
     const user = await tx.user.create({
       data: {
-        email: input.email,
+        login: normalizedLogin,
+        email: `${normalizedLogin}@local.invalid`,
         passwordHash,
-        username: input.username,
-        displayName: input.name ?? input.username ?? null,
+        username: normalizedLogin,
+        displayName: input.name ?? normalizedLogin,
       },
     });
 
@@ -80,7 +81,7 @@ export const issueTokens = async (
   });
 
   return {
-    accessToken: createAccessToken(config, { sub: user.id, email: user.email }),
+    accessToken: createAccessToken(config, { sub: user.id }),
     refreshToken,
   };
 };
@@ -88,23 +89,24 @@ export const issueTokens = async (
 export const authenticateUser = async (
   prisma: PrismaClient,
   input: {
-    email: string;
+    login: string;
     password: string;
   },
 ): Promise<User> => {
+  const normalizedLogin = input.login.trim();
   const user = await prisma.user.findUnique({
     where: {
-      email: input.email,
+      login: normalizedLogin,
     },
   });
 
   if (!user) {
-    throw new AppError(401, "INVALID_CREDENTIALS", "Invalid email or password.");
+    throw new AppError(401, "INVALID_CREDENTIALS", "Invalid login or password.");
   }
 
   const isPasswordValid = await verifyHashedValue(user.passwordHash, input.password);
   if (!isPasswordValid) {
-    throw new AppError(401, "INVALID_CREDENTIALS", "Invalid email or password.");
+    throw new AppError(401, "INVALID_CREDENTIALS", "Invalid login or password.");
   }
 
   return user;
@@ -148,7 +150,6 @@ export const refreshAccessToken = async (
 
   return createAccessToken(config, {
     sub: refreshTokenRecord.user.id,
-    email: refreshTokenRecord.user.email,
   });
 };
 

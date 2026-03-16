@@ -4,7 +4,6 @@ import type { AppConfig } from "../config";
 
 export type AuthUser = {
   userId: string;
-  email: string;
 };
 
 declare module "fastify" {

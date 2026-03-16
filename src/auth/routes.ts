@@ -6,11 +6,10 @@ import { createUser, authenticateUser, issueTokens, refreshAccessToken, revokeRe
 const registerBodySchema = {
   type: "object",
   additionalProperties: false,
-  required: ["email", "password"],
+  required: ["login", "password"],
   properties: {
-    email: { type: "string", format: "email" },
+    login: { type: "string", minLength: 3, maxLength: 32, pattern: "^[a-zA-Z0-9_\\-.]+$" },
     password: { type: "string", minLength: 8, maxLength: 128 },
-    username: { type: "string", minLength: 3, maxLength: 32 },
     name: { type: "string", minLength: 1, maxLength: 120 },
     deviceName: { type: "string", minLength: 1, maxLength: 128 },
   },
@@ -19,9 +18,9 @@ const registerBodySchema = {
 const loginBodySchema = {
   type: "object",
   additionalProperties: false,
-  required: ["email", "password"],
+  required: ["login", "password"],
   properties: {
-    email: { type: "string", format: "email" },
+    login: { type: "string", minLength: 3, maxLength: 32 },
     password: { type: "string", minLength: 8, maxLength: 128 },
     deviceName: { type: "string", minLength: 1, maxLength: 128 },
   },
@@ -60,9 +59,8 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     },
     async (request, reply) => {
       const body = request.body as {
-        email: string;
+        login: string;
         password: string;
-        username?: string;
         name?: string;
         deviceName?: string;
       };
@@ -92,7 +90,7 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     },
     async (request) => {
       const body = request.body as {
-        email: string;
+        login: string;
         password: string;
         deviceName?: string;
       };
