@@ -39,7 +39,9 @@ async function enrichContext(
       ? context.recentRecommendationIds
       : profiles.session.recentRecommendationIds,
     longTermTasteProfile: context.longTermTasteProfile ?? profiles.longTerm,
+    shortTermTasteProfile: context.shortTermTasteProfile ?? profiles.shortTerm,
     sessionTasteProfile: context.sessionTasteProfile ?? profiles.session,
+    userFeatures: context.userFeatures,
   } satisfies RecommendationContext;
 }
 
@@ -95,13 +97,16 @@ export function createRecommendationEngine(
         context: enrichedContext,
         results,
       });
-      profiles.session.recentRecommendationIds = [
-        ...results.map((result) => result.canonicalTrackId),
-        ...profiles.session.recentRecommendationIds,
-      ]
-        .filter((value, index, list) => list.indexOf(value) === index)
-        .slice(0, 32);
-      await saveProfiles(deps.cacheStore, profiles);
+      const surfacedTrackId = results[0]?.canonicalTrackId;
+      if (surfacedTrackId) {
+        profiles.session.recentRecommendationIds = [
+          surfacedTrackId,
+          ...profiles.session.recentRecommendationIds,
+        ]
+          .filter((value, index, list) => list.indexOf(value) === index)
+          .slice(0, 32);
+        await saveProfiles(deps.cacheStore, profiles);
+      }
       return results;
     },
 

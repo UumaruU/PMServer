@@ -41,6 +41,7 @@ describe("recommendation canonicalization", () => {
     expect(track).toBeDefined();
     expect(track.preferredVariantId).toBe("hitmos:singleton-1");
     expect(track.playableVariantIds).toEqual(["hitmos:singleton-1"]);
+    expect(track.targetDurationMs).toBe(210000);
     expect(track.quality.clusterConfidence).toBeGreaterThanOrEqual(
       defaultRecommendationConfig.filtering.minCanonicalConfidence,
     );

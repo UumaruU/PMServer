@@ -207,12 +207,14 @@ export function buildRecommendationCatalogSnapshot(input: {
       const sourceArtist =
         (index === 0 ? primarySourceArtist : undefined) ??
         artistLookup.byNormalizedName.get(recommendationNormalizationService.normalizeArtistCore(artistName));
-      const canonicalArtistId = buildArtistId(artistName, sourceArtist?.musicBrainzArtistId ?? null);
+      const musicBrainzArtistId =
+        sourceArtist?.musicBrainzArtistId ?? (index === 0 ? cluster.musicBrainzArtistId ?? null : null);
+      const canonicalArtistId = buildArtistId(artistName, musicBrainzArtistId);
 
       if (!artistsById[canonicalArtistId]) {
         artistsById[canonicalArtistId] = {
           canonicalArtistId,
-          musicBrainzArtistId: sourceArtist?.musicBrainzArtistId ?? null,
+          musicBrainzArtistId,
           name: sourceArtist?.name ?? artistName,
           normalizedName: recommendationNormalizationService.normalizeArtistCore(sourceArtist?.name ?? artistName),
           aliases: sourceArtist?.name && sourceArtist.name !== artistName ? [artistName] : [],
@@ -317,6 +319,13 @@ export function buildRecommendationCatalogSnapshot(input: {
 
     const trackTagWeights: Record<string, number> = {};
     cluster.titleFlavor.forEach((flavor) => {
+      // "original" is the unmarked default flavor for most tracks and is too generic
+      // to act as a recommendation tag. Keeping it in the tag graph makes almost the
+      // entire catalog look artificially similar and over-penalizes repetition.
+      if (flavor === "original") {
+        return;
+      }
+
       rawTagInputs.push({
         rawTag: flavor,
         evidence: {
@@ -326,7 +335,7 @@ export function buildRecommendationCatalogSnapshot(input: {
           sourceTrust: 0.65,
           extractionMethod: "title-flavor",
           confidence: 0.8,
-          weight: flavor === "original" ? 0.2 : 1,
+          weight: 1,
         },
       });
     });
@@ -355,7 +364,7 @@ export function buildRecommendationCatalogSnapshot(input: {
       labelIds: [],
       language: null,
       explicit: cluster.explicit ?? null,
-      targetDurationMs: (cluster.targetDuration ?? 0) * 1000,
+      targetDurationMs: cluster.targetDuration ?? 0,
       tagIds: [],
       tagWeights: trackTagWeights,
       preferredVariantId: cluster.preferredVariantId ?? null,

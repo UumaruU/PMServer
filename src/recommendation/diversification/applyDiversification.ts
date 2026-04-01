@@ -1,10 +1,119 @@
-import { RecommendationCatalogSnapshot, RecommendationConfig, RecommendationContext } from "../types";
+import {
+  RecommendationCatalogSnapshot,
+  RecommendationConfig,
+  RecommendationContext,
+  RecommendationProfiles,
+} from "../types";
 
-function clamp(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value));
+function countLeadingMatches(values: string[], expected: string | null | undefined) {
+  if (!expected) {
+    return 0;
+  }
+
+  let count = 0;
+  for (const value of values) {
+    if (value !== expected) {
+      break;
+    }
+
+    count += 1;
+  }
+
+  return count;
 }
 
-// Pure domain logic: diversification is applied after scoring and before final selection.
+function buildAntiRepeatArtistTrail(
+  context: RecommendationContext,
+  snapshot: RecommendationCatalogSnapshot,
+) {
+  const historyTrail = context.playbackPrimaryArtistId
+    ? [context.playbackPrimaryArtistId, ...context.recentArtistIds]
+    : context.recentArtistIds;
+  const seenArtists = new Set(historyTrail);
+  const recommendationTrail = (context.recentRecommendationIds ?? [])
+    .map((trackId) => snapshot.tracksById[trackId]?.primaryCanonicalArtistId ?? null)
+    .filter((artistId): artistId is string => !!artistId && !seenArtists.has(artistId));
+
+  return [...historyTrail, ...recommendationTrail];
+}
+
+function getLeadingRecentArtistId(
+  context: RecommendationContext,
+  snapshot: RecommendationCatalogSnapshot,
+) {
+  return buildAntiRepeatArtistTrail(context, snapshot)[0] ?? null;
+}
+
+function countMatchesWithinWindow(values: string[], expected: string | null | undefined, limit: number) {
+  if (!expected || limit <= 0) {
+    return 0;
+  }
+
+  return values.slice(0, limit).reduce((count, value) => count + (value === expected ? 1 : 0), 0);
+}
+
+function hasMeaningfulArtistAlternatives(context: RecommendationContext) {
+  return (context.userFeatures?.topArtists ?? []).filter((entry) => entry.score >= 4).length >= 2;
+}
+
+function strongArtistRepeatInterest(artistId: string | null | undefined, profiles: RecommendationProfiles, context: RecommendationContext) {
+  if (!artistId) {
+    return false;
+  }
+
+  const leadingArtistLoop = countLeadingMatches(context.recentArtistIds, artistId);
+  if (leadingArtistLoop >= 2) {
+    return false;
+  }
+
+  const entityAffinity = profiles.entity.artistAffinities[artistId]?.value ?? 0;
+  const shortTermAffinity = profiles.shortTerm.artistAffinities[artistId]?.value ?? 0;
+  const topArtistScore = context.userFeatures?.topArtists.find((entry) => entry.id === artistId)?.score ?? 0;
+  return entityAffinity >= 8 || shortTermAffinity >= 5.5 || topArtistScore >= 18;
+}
+
+function looksLikeNearDuplicate(
+  left: RecommendationCatalogSnapshot["tracksById"][string] | undefined,
+  right: RecommendationCatalogSnapshot["tracksById"][string] | undefined,
+) {
+  if (!left || !right) {
+    return false;
+  }
+
+  if (left.canonicalTrackId === right.canonicalTrackId) {
+    return true;
+  }
+
+  if (left.musicBrainzRecordingId && right.musicBrainzRecordingId && left.musicBrainzRecordingId === right.musicBrainzRecordingId) {
+    return true;
+  }
+
+  if (left.normalizedTitleCore === right.normalizedTitleCore && left.primaryCanonicalArtistId === right.primaryCanonicalArtistId) {
+    return true;
+  }
+
+  if (left.canonicalReleaseId && right.canonicalReleaseId && left.canonicalReleaseId === right.canonicalReleaseId) {
+    return left.primaryCanonicalArtistId === right.primaryCanonicalArtistId;
+  }
+
+  return false;
+}
+
+function cloneCandidate<T extends { scoreBreakdown: { finalScore: number }; penaltiesApplied: { repetitionPenalty: number; totalPenalty: number } }>(
+  candidate: T,
+) {
+  return {
+    ...candidate,
+    scoreBreakdown: {
+      ...candidate.scoreBreakdown,
+    },
+    penaltiesApplied: {
+      ...candidate.penaltiesApplied,
+    },
+  };
+}
+
+// Pure domain logic: final ordering uses greedy reranking with diversity caps and avoids near-duplicate runs.
 export function applyDiversification<
   T extends {
     canonicalTrackId: string;
@@ -16,69 +125,223 @@ export function applyDiversification<
   candidates: T[];
   snapshot: RecommendationCatalogSnapshot;
   context: RecommendationContext;
+  profiles: RecommendationProfiles;
   config: RecommendationConfig;
 }) {
-  const recentArtistCounts = params.context.recentArtistIds.reduce<Record<string, number>>((accumulator, artistId) => {
-    accumulator[artistId] = (accumulator[artistId] ?? 0) + 1;
-    return accumulator;
-  }, {});
-  const recentReleaseCounts = params.context.recentTrackIds.reduce<Record<string, number>>((accumulator, trackId) => {
-    const track = params.snapshot.tracksById[trackId];
-    if (track?.canonicalReleaseId) {
+  const remaining = params.candidates.map((candidate) => cloneCandidate(candidate));
+  const selected: typeof remaining = [];
+  const leadingRecentArtistId = getLeadingRecentArtistId(params.context, params.snapshot);
+  const artistCooldownLookback = Math.max(0, (params.config.diversification.artistCooldownWindow ?? 10) - 1);
+  const baseHasArtistAlternatives = hasMeaningfulArtistAlternatives(params.context);
+  const antiRepeatArtistTrail = buildAntiRepeatArtistTrail(params.context, params.snapshot);
+  const recentArtistTrail = antiRepeatArtistTrail.slice(0, artistCooldownLookback);
+  const artistCounts = antiRepeatArtistTrail
+    .slice(0, Math.max(artistCooldownLookback, 6))
+    .reduce<Record<string, number>>((accumulator, artistId) => {
+      accumulator[artistId] = (accumulator[artistId] ?? 0) + 1;
+      return accumulator;
+    }, {});
+  const releaseCounts = params.context.recentTrackIds
+    .slice(0, 6)
+    .reduce<Record<string, number>>((accumulator, trackId) => {
+      const track = params.snapshot.tracksById[trackId];
+      if (!track?.canonicalReleaseId) {
+        return accumulator;
+      }
+
       accumulator[track.canonicalReleaseId] = (accumulator[track.canonicalReleaseId] ?? 0) + 1;
-    }
-    return accumulator;
-  }, {});
-  const recentTagCounts = params.context.recentTrackIds.reduce<Record<string, number>>((accumulator, trackId) => {
-    const track = params.snapshot.tracksById[trackId];
-    track?.tagIds.forEach((tagId) => {
-      accumulator[tagId] = (accumulator[tagId] ?? 0) + 1;
-    });
-    return accumulator;
-  }, {});
+      return accumulator;
+    }, {});
+  const tagCounts = params.context.recentTrackIds
+    .slice(0, 6)
+    .reduce<Record<string, number>>((accumulator, trackId) => {
+      const track = params.snapshot.tracksById[trackId];
+      if (!track) {
+        return accumulator;
+      }
 
-  return params.candidates
-    .map((candidate) => {
+      track.tagIds.forEach((tagId) => {
+        accumulator[tagId] = (accumulator[tagId] ?? 0) + 1;
+      });
+
+      return accumulator;
+    }, {});
+
+  while (remaining.length) {
+    const poolOffCooldownArtists = new Set(
+      remaining
+        .map((candidate) => candidate.__track.primaryCanonicalArtistId)
+        .filter((artistId): artistId is string => !!artistId && !recentArtistTrail.includes(artistId)),
+    );
+    const hasPoolArtistAlternatives = poolOffCooldownArtists.size >= 1;
+    const hasArtistAlternatives = baseHasArtistAlternatives || hasPoolArtistAlternatives;
+    let bestIndex = -1;
+    let bestScore = Number.NEGATIVE_INFINITY;
+
+    for (let index = 0; index < remaining.length; index += 1) {
+      const candidate = remaining[index];
       const track = candidate.__track;
-      let extraPenalty = 0;
+      const selectedCount = selected.length;
+      const currentArtistCount = track.primaryCanonicalArtistId ? artistCounts[track.primaryCanonicalArtistId] ?? 0 : 0;
+      const currentReleaseCount = track.canonicalReleaseId ? releaseCounts[track.canonicalReleaseId] ?? 0 : 0;
+      const repeatedTagCount = track.tagIds.reduce((max, tagId) => Math.max(max, tagCounts[tagId] ?? 0), 0);
+      const repeatInterest = strongArtistRepeatInterest(track.primaryCanonicalArtistId, params.profiles, params.context);
+      const artistCooldownMatches = countMatchesWithinWindow(
+        recentArtistTrail,
+        track.primaryCanonicalArtistId,
+        artistCooldownLookback,
+      );
+      const artistCooldownActive = artistCooldownMatches > 0;
+
+      if (selectedCount < 10) {
+        if (track.primaryCanonicalArtistId && currentArtistCount >= 2) {
+          continue;
+        }
+
+        if (track.canonicalReleaseId && currentReleaseCount >= 2) {
+          continue;
+        }
+
+        if (repeatedTagCount >= 3) {
+          continue;
+        }
+      }
 
       if (
+        hasArtistAlternatives &&
+        artistCooldownActive &&
         track.primaryCanonicalArtistId &&
-        (recentArtistCounts[track.primaryCanonicalArtistId] ?? 0) >= params.config.diversification.sameArtistStreak
+        (!repeatInterest || hasPoolArtistAlternatives)
       ) {
-        extraPenalty += 0.75;
+        continue;
       }
 
-      if (
-        track.canonicalReleaseId &&
-        (recentReleaseCounts[track.canonicalReleaseId] ?? 0) >= params.config.diversification.sameReleaseStreak
-      ) {
-        extraPenalty += 0.75;
+      const shouldBlockImmediateArtistRepeat =
+        hasArtistAlternatives &&
+        track.primaryCanonicalArtistId &&
+        selectedCount < 10 &&
+        (!repeatInterest || hasPoolArtistAlternatives) &&
+        (track.primaryCanonicalArtistId === leadingRecentArtistId || currentArtistCount >= 2);
+
+      if (shouldBlockImmediateArtistRepeat) {
+        continue;
       }
 
-      const repeatedTagCount = track.tagIds.reduce(
-        (max, tagId) => Math.max(max, recentTagCounts[tagId] ?? 0),
-        0,
-      );
-      if (repeatedTagCount >= params.config.diversification.sameNarrowTagClusterStreak) {
-        extraPenalty += 0.35;
+      if (selectedCount < 5 && looksLikeNearDuplicate(track, selected[selected.length - 1]?.__track)) {
+        continue;
       }
 
-      const cappedPenalty = clamp(
-        extraPenalty,
-        0,
-        Math.max(0, candidate.scoreBreakdown.finalScore * params.config.diversification.maxPenaltyShare),
-      );
-      candidate.penaltiesApplied.repetitionPenalty += cappedPenalty;
-      candidate.penaltiesApplied.totalPenalty += cappedPenalty;
-      candidate.scoreBreakdown.finalScore -= cappedPenalty;
-      return candidate;
-    })
-    .sort((left, right) => {
-      if (left.scoreBreakdown.finalScore !== right.scoreBreakdown.finalScore) {
-        return right.scoreBreakdown.finalScore - left.scoreBreakdown.finalScore;
+      let extraPenalty = 0;
+      if (currentArtistCount > 0) {
+        extraPenalty += repeatInterest
+          ? (hasArtistAlternatives ? 0.16 : 0.08) * currentArtistCount
+          : (hasArtistAlternatives ? 0.34 : 0.14) * currentArtistCount;
       }
 
-      return left.canonicalTrackId.localeCompare(right.canonicalTrackId);
+      if (artistCooldownActive) {
+        extraPenalty += hasArtistAlternatives ? 1.35 + Math.max(0, artistCooldownMatches - 1) * 0.2 : 0.2;
+      }
+
+      if (currentReleaseCount > 0) {
+        extraPenalty += 0.3 * currentReleaseCount;
+      }
+
+      if (repeatedTagCount > 0) {
+        extraPenalty += 0.12 * repeatedTagCount;
+      }
+
+      if (selectedCount < 5 && looksLikeNearDuplicate(track, selected[selected.length - 2]?.__track)) {
+        extraPenalty += 0.5;
+      }
+
+      const rerankedScore = candidate.scoreBreakdown.finalScore - extraPenalty;
+      if (rerankedScore > bestScore) {
+        bestScore = rerankedScore;
+        bestIndex = index;
+      }
+    }
+
+    if (bestIndex < 0) {
+      for (let index = 0; index < remaining.length; index += 1) {
+        const candidate = remaining[index];
+        const track = candidate.__track;
+        const currentArtistCount = track.primaryCanonicalArtistId ? artistCounts[track.primaryCanonicalArtistId] ?? 0 : 0;
+        const currentReleaseCount = track.canonicalReleaseId ? releaseCounts[track.canonicalReleaseId] ?? 0 : 0;
+        const repeatedTagCount = track.tagIds.reduce((max, tagId) => Math.max(max, tagCounts[tagId] ?? 0), 0);
+        const repeatInterest = strongArtistRepeatInterest(track.primaryCanonicalArtistId, params.profiles, params.context);
+        const artistCooldownMatches = countMatchesWithinWindow(
+          recentArtistTrail,
+          track.primaryCanonicalArtistId,
+          artistCooldownLookback,
+        );
+        const fallbackPenalty =
+          (currentArtistCount > 0
+            ? (repeatInterest
+                ? (hasArtistAlternatives ? 0.1 : 0.04)
+                : (hasArtistAlternatives ? 0.18 : 0.08)) * currentArtistCount
+            : 0) +
+          (artistCooldownMatches > 0 ? (hasArtistAlternatives ? 0.45 : 0.08) + Math.max(0, artistCooldownMatches - 1) * 0.05 : 0) +
+          (currentReleaseCount > 0 ? 0.08 * currentReleaseCount : 0) +
+          (repeatedTagCount > 0 ? 0.04 * repeatedTagCount : 0);
+        const fallbackScore = candidate.scoreBreakdown.finalScore - fallbackPenalty;
+
+        if (fallbackScore > bestScore) {
+          bestScore = fallbackScore;
+          bestIndex = index;
+        }
+      }
+    }
+
+    if (bestIndex < 0) {
+      break;
+    }
+
+    const [picked] = remaining.splice(bestIndex, 1);
+    const track = picked.__track;
+    const artistCount = track.primaryCanonicalArtistId ? artistCounts[track.primaryCanonicalArtistId] ?? 0 : 0;
+    const releaseCount = track.canonicalReleaseId ? releaseCounts[track.canonicalReleaseId] ?? 0 : 0;
+    const repeatedTagCount = track.tagIds.reduce((max, tagId) => Math.max(max, tagCounts[tagId] ?? 0), 0);
+    const repeatInterest = strongArtistRepeatInterest(track.primaryCanonicalArtistId, params.profiles, params.context);
+    const artistCooldownMatches = countMatchesWithinWindow(
+      recentArtistTrail,
+      track.primaryCanonicalArtistId,
+      artistCooldownLookback,
+    );
+    const finalExtraPenalty =
+      (artistCount > 0
+        ? (repeatInterest
+            ? (hasArtistAlternatives ? 0.16 : 0.08)
+            : (hasArtistAlternatives ? 0.34 : 0.14)) * artistCount
+        : 0) +
+      (artistCooldownMatches > 0
+        ? (hasArtistAlternatives ? 1.35 : 0.2) + Math.max(0, artistCooldownMatches - 1) * (hasArtistAlternatives ? 0.2 : 0.05)
+        : 0) +
+      (releaseCount > 0 ? 0.3 * releaseCount : 0) +
+      (repeatedTagCount > 0 ? 0.12 * repeatedTagCount : 0);
+
+    picked.penaltiesApplied.repetitionPenalty += finalExtraPenalty;
+    picked.penaltiesApplied.totalPenalty += finalExtraPenalty;
+    picked.scoreBreakdown.finalScore -= finalExtraPenalty;
+    selected.push(picked);
+
+    if (track.primaryCanonicalArtistId) {
+      artistCounts[track.primaryCanonicalArtistId] = (artistCounts[track.primaryCanonicalArtistId] ?? 0) + 1;
+      recentArtistTrail.unshift(track.primaryCanonicalArtistId);
+      if (artistCooldownLookback > 0) {
+        recentArtistTrail.splice(artistCooldownLookback);
+      } else {
+        recentArtistTrail.length = 0;
+      }
+    }
+
+    if (track.canonicalReleaseId) {
+      releaseCounts[track.canonicalReleaseId] = (releaseCounts[track.canonicalReleaseId] ?? 0) + 1;
+    }
+
+    track.tagIds.forEach((tagId) => {
+      tagCounts[tagId] = (tagCounts[tagId] ?? 0) + 1;
     });
+  }
+
+  return selected;
 }

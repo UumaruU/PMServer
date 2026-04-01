@@ -263,7 +263,7 @@ function isStrongArtistMismatch(left: PreparedTrack, right: PreparedTrack) {
 }
 
 function getDurationDeltaMs(left: RecommendationSourceTrack, right: RecommendationSourceTrack) {
-  return Math.abs(left.duration - right.duration) * 1000;
+  return Math.abs(left.duration - right.duration);
 }
 
 function getTrackMetadataQuality(track: PreparedTrack) {
@@ -396,9 +396,9 @@ function dedupeTracksById(tracks: PreparedTrack[]) {
 }
 
 function buildClusterGroupKey(clusterTracks: PreparedTrack[]) {
-  const targetDurationSeconds = getMedian(clusterTracks.map((variant) => variant.duration));
-  const preferredVariant = choosePreferredVariant(clusterTracks, targetDurationSeconds);
-  const canonicalId = buildCanonicalId(clusterTracks, preferredVariant, targetDurationSeconds);
+  const targetDurationMs = getMedian(clusterTracks.map((variant) => variant.duration));
+  const preferredVariant = choosePreferredVariant(clusterTracks, targetDurationMs);
+  const canonicalId = buildCanonicalId(clusterTracks, preferredVariant, targetDurationMs);
 
   if (canonicalId.startsWith("mbrec:") || canonicalId.startsWith("acoustid:")) {
     return canonicalId;
@@ -814,7 +814,7 @@ export function buildCanonicalLyricsCacheKey(
 ) {
   const durationBucket = recommendationNormalizationService.getDurationBucket(
     canonicalTrack.targetDuration ?? 0,
-    config.lyricsDurationBucketMs / 1000,
+    config.lyricsDurationBucketMs,
   );
 
   return [
@@ -934,9 +934,9 @@ export const recommendationTrackCanonicalizationService = {
       .map((variants) => dedupeTracksById(sortTracksDeterministically(variants)))
       .map((clusterTracks) => {
         const variants = sortTracksDeterministically(clusterTracks);
-        const targetDurationSeconds = getMedian(variants.map((variant) => variant.duration));
-        const preferredVariant = choosePreferredVariant(variants, targetDurationSeconds);
-        const canonicalId = buildCanonicalId(variants, preferredVariant, targetDurationSeconds);
+        const targetDurationMs = getMedian(variants.map((variant) => variant.duration));
+        const preferredVariant = choosePreferredVariant(variants, targetDurationMs);
+        const canonicalId = buildCanonicalId(variants, preferredVariant, targetDurationMs);
         const titleVariant = selectTrackByField(
           variants,
           (variant) => variant.title,
@@ -986,7 +986,7 @@ export const recommendationTrackCanonicalizationService = {
           normalizedArtistCore: artistVariant.normalizedArtistCore ?? null,
           primaryArtist: artistVariant.primaryArtist ?? null,
           titleFlavor: dedupeStrings(variants.flatMap((variant) => variant.titleFlavor)) as TitleFlavor[],
-          targetDuration: targetDurationSeconds,
+          targetDuration: targetDurationMs,
           variantTrackIds,
           preferredVariantId: preferredVariant.id,
           musicBrainzRecordingId: musicBrainzVariant.musicBrainzRecordingId ?? null,

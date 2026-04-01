@@ -57,7 +57,26 @@ export type RecommendationChannel =
   | "sharedTags"
   | "releaseEraProximity"
   | "sessionContinuation"
-  | "userAffinityRetrieval";
+  | "userAffinityRetrieval"
+  | "userTopArtists"
+  | "userTopTags"
+  | "userTopTracks"
+  | "playlistCooccurrence"
+  | "sessionTransitions"
+  | "searchIntent"
+  | "adjacentDiscovery"
+  | "safeExploration";
+
+export type RecommendationDiscoveryLevel = "safe" | "balanced" | "exploratory";
+export type RecommendationStrategy = "user-feed" | "user+context" | "cold-start";
+export type RecommendationInteractionAction =
+  | "open"
+  | "play"
+  | "skip"
+  | "queue"
+  | "dismiss"
+  | "favorite"
+  | "playlist_add";
 
 export interface CanonicalizationConfig {
   strictMergeThreshold: number;
@@ -421,7 +440,37 @@ export interface AffinityEntry {
   eventCount: number;
 }
 
+export interface BootstrapTasteProfile {
+  updatedAt: string;
+  artistIds: string[];
+  artistNames: string[];
+  tagIds: string[];
+  tags: string[];
+  languages: string[];
+  discoveryLevel: RecommendationDiscoveryLevel;
+}
+
+export interface ExposureFatigueEntry {
+  impressionCount: number;
+  ignoredCount: number;
+  dismissedCount: number;
+  lastImpressionAt: string;
+  lastPositiveInteractionAt?: string | null;
+  hiddenUntil?: string | null;
+}
+
 export interface LongTermTasteProfile {
+  updatedAt: string;
+  artistAffinities: Record<string, AffinityEntry>;
+  tagAffinities: Record<string, AffinityEntry>;
+  collaboratorAffinities: Record<string, AffinityEntry>;
+  releaseAffinities: Record<string, AffinityEntry>;
+  flavorAffinities: Record<string, AffinityEntry>;
+  languageAffinities: Record<string, AffinityEntry>;
+  eraAffinities: Record<string, AffinityEntry>;
+}
+
+export interface ShortTermTasteProfile {
   updatedAt: string;
   artistAffinities: Record<string, AffinityEntry>;
   tagAffinities: Record<string, AffinityEntry>;
@@ -440,8 +489,10 @@ export interface SessionTasteProfile {
   recentTagIds: string[];
   recentRecommendationIds: string[];
   recentSkippedTrackIds: string[];
+  recentFastSkippedTrackIds: string[];
   recentFavoritedTrackIds: string[];
   recentDislikedTrackIds: string[];
+  recentDismissedTrackIds: string[];
   dominantMoodTagId?: string | null;
   dominantGenreTagId?: string | null;
   dominantFlavor?: TitleFlavor | null;
@@ -459,12 +510,50 @@ export interface EntityAffinityProfile {
   releaseAffinities: Record<string, AffinityEntry>;
   collaboratorAffinities: Record<string, AffinityEntry>;
   dislikedTrackIds: string[];
+  fastSkippedTrackIds: string[];
+  dismissedTrackIds: string[];
+  exposureFatigueByTrackId: Record<string, ExposureFatigueEntry>;
 }
 
 export interface RecommendationProfiles {
+  bootstrap: BootstrapTasteProfile;
+  shortTerm: ShortTermTasteProfile;
   longTerm: LongTermTasteProfile;
   session: SessionTasteProfile;
   entity: EntityAffinityProfile;
+}
+
+export interface RankedFeatureEntry {
+  id: string;
+  score: number;
+}
+
+export interface RecommendationSearchIntentSummary {
+  queries: string[];
+  trackScores: Record<string, number>;
+  artistScores: Record<string, number>;
+  tagScores: Record<string, number>;
+}
+
+export interface RecommendationNegativeSummary {
+  hardSuppressedTrackIds: string[];
+  temporarilyHiddenTrackIds: string[];
+  fatiguePenaltyByTrackId: Record<string, number>;
+}
+
+export interface UserRecommendationFeatures {
+  strategy: RecommendationStrategy;
+  contextSummary: string;
+  favoriteVariantIds: string[];
+  topArtists: RankedFeatureEntry[];
+  topTags: RankedFeatureEntry[];
+  topTracks: RankedFeatureEntry[];
+  topReleases: RankedFeatureEntry[];
+  playlistTrackScores: Record<string, number>;
+  sessionTransitionScores: Record<string, number>;
+  searchIntent: RecommendationSearchIntentSummary;
+  negative: RecommendationNegativeSummary;
+  hasStrongPersonalSignals: boolean;
 }
 
 export interface RecommendationSeed {
@@ -479,6 +568,7 @@ export interface RecommendationContext {
   mode: RecommendationMode;
   currentCanonicalTrackId?: string | null;
   currentPrimaryArtistId?: string | null;
+  playbackPrimaryArtistId?: string | null;
   currentFeaturedArtistIds: string[];
   currentTrackTagIds: string[];
   currentArtistTagIds: string[];
@@ -492,7 +582,9 @@ export interface RecommendationContext {
   skippedTrackIds: string[];
   favoritedTrackIds: string[];
   longTermTasteProfile?: LongTermTasteProfile;
+  shortTermTasteProfile?: ShortTermTasteProfile;
   sessionTasteProfile?: SessionTasteProfile;
+  userFeatures?: UserRecommendationFeatures;
 }
 
 export interface ScoreBreakdown {
@@ -509,6 +601,11 @@ export interface ScoreBreakdown {
   availabilityScore: number;
   popularityPriorScore: number;
   noveltyScore: number;
+  userAffinityScore: number;
+  recentIntentScore: number;
+  cooccurrenceScore: number;
+  contextScore: number;
+  explorationScore: number;
   finalScore: number;
 }
 
@@ -591,6 +688,35 @@ export interface DislikeAffinityEvent {
   isDisliked: boolean;
 }
 
+export interface RecommendationOnboardingProfileInput {
+  artistIds?: string[];
+  artistNames?: string[];
+  tags?: string[];
+  languages?: string[];
+  discoveryLevel?: RecommendationDiscoveryLevel;
+}
+
+export interface RecommendationImpressionEvent {
+  requestId: string;
+  surface: string;
+  position: number;
+  canonicalTrackId: string;
+  occurredAt: string;
+}
+
+export interface RecommendationInteractionEvent {
+  requestId: string;
+  surface: string;
+  position: number;
+  canonicalTrackId: string;
+  action: RecommendationInteractionAction;
+  occurredAt: string;
+  listenedMs?: number;
+  trackDurationMs?: number;
+  playlistId?: string;
+  metadata?: Record<string, unknown> | null;
+}
+
 export interface ProviderFieldTrust {
   identity: number;
   releaseMetadata: number;
@@ -630,11 +756,28 @@ export interface RecommendationScoringWeights {
   explicitMismatchPenalty: number;
 }
 
+export interface UserCentricBlendWeights {
+  userAffinity: number;
+  recentIntent: number;
+  cooccurrence: number;
+  currentTrackContext: number;
+  qualityAvailability: number;
+  noveltyExploration: number;
+  currentTrackContextMaxShare: number;
+}
+
+export interface RecommendationExposureConfig {
+  fatigueWindowMs: number;
+  fatiguePenaltyThreshold: number;
+  hardHideThreshold: number;
+}
+
 export interface RecommendationConfig {
   canonicalization: CanonicalizationConfig;
   providers: Record<RecommendationProviderId, RecommendationProviderDefinition>;
   candidatePoolSizes: Record<RecommendationChannel, number>;
   scoringWeights: RecommendationScoringWeights;
+  userCentricBlend: UserCentricBlendWeights;
   completionThresholds: {
     strongNegative: number;
     negative: number;
@@ -648,15 +791,18 @@ export interface RecommendationConfig {
   };
   decay: {
     sessionHalfLifeMs: number;
+    shortTermHalfLifeMs: number;
     longTermHalfLifeMs: number;
     playlistHalfLifeMs: number;
     favoriteHalfLifeMs: number;
     dislikeHalfLifeMs: number;
   };
+  exposure: RecommendationExposureConfig;
   filtering: {
     minCanonicalConfidence: number;
   };
   diversification: {
+    artistCooldownWindow: number;
     sameArtistStreak: number;
     sameReleaseStreak: number;
     sameNarrowTagClusterStreak: number;

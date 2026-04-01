@@ -1,0 +1,6 @@
+ALTER TYPE "RecommendationEventType" ADD VALUE IF NOT EXISTS 'IMPRESSION';
+ALTER TYPE "RecommendationEventType" ADD VALUE IF NOT EXISTS 'INTERACTION';
+
+ALTER TABLE "UserRecommendationProfile"
+ADD COLUMN IF NOT EXISTS "bootstrapProfile" JSONB NOT NULL DEFAULT '{}'::jsonb,
+ADD COLUMN IF NOT EXISTS "shortTermProfile" JSONB NOT NULL DEFAULT '{}'::jsonb;

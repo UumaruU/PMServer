@@ -54,6 +54,7 @@ export function getRankedTrackRecommendations(params: {
     candidates: filtered,
     snapshot: params.snapshot,
     context: params.context,
+    profiles: params.profiles,
     config: params.config,
   });
 
@@ -96,10 +97,7 @@ export function getRankedArtistRecommendations(params: {
   profiles: RecommendationProfiles;
   config: RecommendationConfig;
 }) {
-  const currentTrack = params.context.currentCanonicalTrackId
-    ? params.snapshot.tracksById[params.context.currentCanonicalTrackId] ?? null
-    : null;
-  const currentArtistId = currentTrack?.primaryCanonicalArtistId ?? params.seed.canonicalArtistId ?? null;
+  const currentArtistId = params.seed.canonicalArtistId ?? null;
 
   return Object.values(params.snapshot.artistsById)
     .filter((artist) => artist.canonicalArtistId !== currentArtistId)
@@ -114,7 +112,7 @@ export function getRankedArtistRecommendations(params: {
         : 0;
       const tagOverlap = topTagOverlapForArtist(
         params.snapshot,
-        currentTrack?.tagIds ?? Object.keys(params.context.recentTagCloud),
+        Object.keys(params.context.recentTagCloud),
         artist.canonicalArtistId,
       );
       const userArtistAffinity = params.profiles.entity.artistAffinities[artist.canonicalArtistId]?.value ?? 0;

@@ -63,6 +63,14 @@ export const defaultRecommendationConfig: RecommendationConfig = {
     releaseEraProximity: 25,
     sessionContinuation: 40,
     userAffinityRetrieval: 50,
+    userTopArtists: 60,
+    userTopTags: 60,
+    userTopTracks: 40,
+    playlistCooccurrence: 60,
+    sessionTransitions: 40,
+    searchIntent: 30,
+    adjacentDiscovery: 40,
+    safeExploration: 30,
   },
   scoringWeights: {
     sameArtist: 2.4,
@@ -83,6 +91,15 @@ export const defaultRecommendationConfig: RecommendationConfig = {
     skipPenalty: 2.0,
     explicitMismatchPenalty: 2.2,
   },
+  userCentricBlend: {
+    userAffinity: 0.45,
+    recentIntent: 0.2,
+    cooccurrence: 0.15,
+    currentTrackContext: 0.1,
+    qualityAvailability: 0.05,
+    noveltyExploration: 0.05,
+    currentTrackContextMaxShare: 0.25,
+  },
   completionThresholds: {
     strongNegative: 0.15,
     negative: 0.4,
@@ -96,15 +113,22 @@ export const defaultRecommendationConfig: RecommendationConfig = {
   },
   decay: {
     sessionHalfLifeMs: 6 * HOUR_MS,
+    shortTermHalfLifeMs: 14 * DAY_MS,
     longTermHalfLifeMs: 45 * DAY_MS,
     playlistHalfLifeMs: 60 * DAY_MS,
     favoriteHalfLifeMs: 180 * DAY_MS,
     dislikeHalfLifeMs: 120 * DAY_MS,
   },
+  exposure: {
+    fatigueWindowMs: 7 * DAY_MS,
+    fatiguePenaltyThreshold: 3,
+    hardHideThreshold: 5,
+  },
   filtering: {
     minCanonicalConfidence: 0.55,
   },
   diversification: {
+    artistCooldownWindow: 10,
     sameArtistStreak: 3,
     sameReleaseStreak: 4,
     sameNarrowTagClusterStreak: 4,

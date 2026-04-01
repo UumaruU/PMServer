@@ -377,12 +377,12 @@ export function normalizeTrackPresentation(title: string, artist: string) {
   };
 }
 
-export function getDurationBucket(durationSeconds: number, sizeSeconds = 2) {
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+export function getDurationBucket(durationMs: number, sizeMs = 2_000) {
+  if (!Number.isFinite(durationMs) || durationMs <= 0) {
     return 0;
   }
 
-  return Math.round(durationSeconds / sizeSeconds);
+  return Math.round(durationMs / sizeMs);
 }
 
 export function normalizeTrackForCanonicalization(track: RecommendationSourceTrack) {

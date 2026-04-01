@@ -26,6 +26,8 @@ enum RecommendationEventType {
   FAVORITE
   PLAYLIST
   DISLIKE
+  IMPRESSION
+  INTERACTION
 }
 
 model User {
@@ -162,6 +164,8 @@ model UserSearchHistoryEntry {
 
 model UserRecommendationProfile {
   userId           String   @id @db.Uuid
+  bootstrapProfile Json
+  shortTermProfile Json
   longTermProfile  Json
   sessionProfile   Json
   entityProfile    Json

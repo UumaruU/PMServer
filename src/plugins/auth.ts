@@ -13,6 +13,19 @@ export const registerAuthDecorator = (app: FastifyInstance): void => {
         throw new Error("Missing JWT subject.");
       }
 
+      const user = await app.prisma.user.findUnique({
+        where: {
+          id: userId,
+        },
+        select: {
+          id: true,
+        },
+      });
+
+      if (!user) {
+        throw new Error("User not found for verified JWT subject.");
+      }
+
       request.authUser = {
         userId,
       };

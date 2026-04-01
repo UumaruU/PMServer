@@ -737,6 +737,643 @@ describeIfDb("Pingu Music API", () => {
     expect(await prisma.userRecommendationEvent.count({ where: { userId: body.user.id } })).toBeGreaterThan(0);
   });
 
+  it("builds a personalized user feed without requiring a current track", async () => {
+    const { body } = await registerUser();
+    const liked = await resolveTrack(body.accessToken, {
+      sourceTrackId: "ufeed-1",
+      title: "Moonlit Streets",
+      artistName: "Northern Lights",
+      audioUrl: "https://example.invalid/ufeed-1.mp3",
+      duration: 210000,
+      musicBrainzArtistId: "mb-user-feed-artist",
+    });
+    const historyPick = await resolveTrack(body.accessToken, {
+      sourceTrackId: "ufeed-2",
+      title: "City Horizon",
+      artistName: "Northern Lights",
+      audioUrl: "https://example.invalid/ufeed-2.mp3",
+      duration: 205000,
+      musicBrainzArtistId: "mb-user-feed-artist",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "ufeed-3",
+      title: "Late Neon",
+      artistName: "Northern Lights",
+      audioUrl: "https://example.invalid/ufeed-3.mp3",
+      duration: 208000,
+      musicBrainzArtistId: "mb-user-feed-artist",
+    });
+
+    await app.inject({
+      method: "POST",
+      url: "/me/favorites",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: liked.body.track.id,
+      },
+    });
+    await app.inject({
+      method: "POST",
+      url: "/me/history/events",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: historyPick.body.track.id,
+        eventType: "COMPLETED",
+        playedMs: 200000,
+      },
+    });
+
+    const stream = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        limit: 5,
+        mode: "autoplay",
+      },
+    });
+    expect(stream.statusCode).toBe(200);
+
+    const streamBody = stream.json() as {
+      requestId: string;
+      strategy: string;
+      contextSummary: string;
+      queueMode: string;
+      visibleQueueLength: number;
+      items: Array<{ track: { artist: string } }>;
+    };
+    expect(streamBody.requestId).toBeTruthy();
+    expect(streamBody.strategy).toBe("user-feed");
+    expect(streamBody.contextSummary.length).toBeGreaterThan(0);
+    expect(streamBody.queueMode).toBe("single-next");
+    expect(streamBody.visibleQueueLength).toBe(1);
+    expect(streamBody.items.length).toBe(1);
+    expect(streamBody.items.some((item) => item.track.artist === "Northern Lights")).toBe(true);
+  });
+
+  it("uses favorites as taste signals without replaying the exact favorite too aggressively", async () => {
+    const { body } = await registerUser();
+    const favoriteTrack = await resolveTrack(body.accessToken, {
+      sourceTrackId: "fav-signal-1",
+      title: "Chrome Heart",
+      artistName: "Metro Bloom",
+      audioUrl: "https://example.invalid/fav-signal-1.mp3",
+      duration: 206000,
+      musicBrainzArtistId: "mb-fav-signal",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "fav-signal-2",
+      title: "Glass Night",
+      artistName: "Metro Bloom",
+      audioUrl: "https://example.invalid/fav-signal-2.mp3",
+      duration: 209000,
+      musicBrainzArtistId: "mb-fav-signal",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "fav-signal-3",
+      title: "Silver Avenue",
+      artistName: "Metro Bloom",
+      audioUrl: "https://example.invalid/fav-signal-3.mp3",
+      duration: 212000,
+      musicBrainzArtistId: "mb-fav-signal",
+    });
+
+    const favorite = await app.inject({
+      method: "POST",
+      url: "/me/favorites",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: favoriteTrack.body.track.id,
+      },
+    });
+    expect(favorite.statusCode).toBe(201);
+
+    const stream = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        limit: 10,
+        mode: "autoplay",
+      },
+    });
+    expect(stream.statusCode).toBe(200);
+
+    const streamBody = stream.json() as {
+      items: Array<{ track: { id: string; artist: string } }>;
+      queueMode: string;
+    };
+    expect(streamBody.queueMode).toBe("single-next");
+    expect(streamBody.items.length).toBe(1);
+    expect(streamBody.items[0]?.track.artist).toBe("Metro Bloom");
+    expect(streamBody.items[0]?.track.id).not.toBe(favoriteTrack.externalTrackId);
+  });
+
+  it("keeps wave recommendations one-step-ahead instead of prebuilding a full queue", async () => {
+    const { body } = await registerUser();
+    const seed = await resolveTrack(body.accessToken, {
+      sourceTrackId: "wave-step-1",
+      title: "Night Drive",
+      artistName: "Static Youth",
+      audioUrl: "https://example.invalid/wave-step-1.mp3",
+      duration: 201000,
+      musicBrainzArtistId: "mb-wave-step-artist",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "wave-step-2",
+      title: "Mirror City",
+      artistName: "Static Youth",
+      audioUrl: "https://example.invalid/wave-step-2.mp3",
+      duration: 205000,
+      musicBrainzArtistId: "mb-wave-step-artist",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "wave-step-3",
+      title: "Ocean Dialtone",
+      artistName: "Static Youth",
+      audioUrl: "https://example.invalid/wave-step-3.mp3",
+      duration: 209000,
+      musicBrainzArtistId: "mb-wave-step-artist",
+    });
+
+    await app.inject({
+      method: "POST",
+      url: "/me/favorites",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: seed.body.track.id,
+      },
+    });
+
+    const firstWave = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        mode: "autoplay",
+      },
+    });
+    expect(firstWave.statusCode).toBe(200);
+
+    const firstWaveBody = firstWave.json() as {
+      items: Array<{ track: { id: string } }>;
+      queueMode: string;
+      visibleQueueLength: number;
+    };
+    expect(firstWaveBody.queueMode).toBe("single-next");
+    expect(firstWaveBody.visibleQueueLength).toBe(1);
+    expect(firstWaveBody.items.length).toBe(1);
+
+    const heldTrackId = firstWaveBody.items[0]!.track.id;
+    const secondWave = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        mode: "autoplay",
+        recentRecommendationTrackIds: [heldTrackId],
+      },
+    });
+    expect(secondWave.statusCode).toBe(200);
+
+    const secondWaveBody = secondWave.json() as {
+      items: Array<{ track: { id: string } }>;
+      visibleQueueLength: number;
+    };
+    expect(secondWaveBody.visibleQueueLength).toBe(0);
+    expect(secondWaveBody.items.length).toBe(0);
+
+    const advancedWave = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        mode: "autoplay",
+        currentTrackId: heldTrackId,
+      },
+    });
+    expect(advancedWave.statusCode).toBe(200);
+
+    const advancedWaveBody = advancedWave.json() as {
+      items: Array<{ track: { id: string } }>;
+      visibleQueueLength: number;
+    };
+    expect(advancedWaveBody.visibleQueueLength).toBe(1);
+    expect(advancedWaveBody.items.length).toBe(1);
+    expect(advancedWaveBody.items[0]!.track.id).not.toBe(heldTrackId);
+  });
+
+  it("uses onboarding preferences for cold-start recommendations", async () => {
+    const { body } = await registerUser();
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "cold-1",
+      title: "Sky Lantern",
+      artistName: "Starlight Echo",
+      audioUrl: "https://example.invalid/cold-1.mp3",
+      duration: 198000,
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "cold-2",
+      title: "Aurora Bloom",
+      artistName: "Starlight Echo",
+      audioUrl: "https://example.invalid/cold-2.mp3",
+      duration: 202000,
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "cold-3",
+      title: "Harbor Static",
+      artistName: "Other Artist",
+      audioUrl: "https://example.invalid/cold-3.mp3",
+      duration: 214000,
+    });
+
+    const onboarding = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/onboarding-profile",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        artistNames: ["Starlight Echo"],
+        discoveryLevel: "safe",
+      },
+    });
+    expect(onboarding.statusCode).toBe(200);
+
+    const stream = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        limit: 5,
+        mode: "autoplay",
+      },
+    });
+    expect(stream.statusCode).toBe(200);
+
+    const streamBody = stream.json() as {
+      strategy: string;
+      items: Array<{ track: { artist: string } }>;
+    };
+    expect(streamBody.strategy).toBe("cold-start");
+    expect(streamBody.items.length).toBeGreaterThan(0);
+    expect(streamBody.items[0]?.track.artist).toBe("Starlight Echo");
+  });
+
+  it("suppresses dismissed recommendation candidates on subsequent requests", async () => {
+    const { body } = await registerUser();
+    const anchor = await resolveTrack(body.accessToken, {
+      sourceTrackId: "dismiss-1",
+      title: "Signal Fire",
+      artistName: "Silver Harbor",
+      audioUrl: "https://example.invalid/dismiss-1.mp3",
+      duration: 201000,
+      musicBrainzArtistId: "mb-dismiss-artist",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "dismiss-2",
+      title: "Ocean Glass",
+      artistName: "Silver Harbor",
+      audioUrl: "https://example.invalid/dismiss-2.mp3",
+      duration: 204000,
+      musicBrainzArtistId: "mb-dismiss-artist",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "dismiss-3",
+      title: "Hidden Tide",
+      artistName: "Silver Harbor",
+      audioUrl: "https://example.invalid/dismiss-3.mp3",
+      duration: 206000,
+      musicBrainzArtistId: "mb-dismiss-artist",
+    });
+
+    await app.inject({
+      method: "POST",
+      url: "/me/favorites",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: anchor.body.track.id,
+      },
+    });
+
+    const firstStream = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        limit: 5,
+        mode: "autoplay",
+      },
+    });
+    expect(firstStream.statusCode).toBe(200);
+
+    const firstBody = firstStream.json() as {
+      requestId: string;
+      items: Array<{ track: { id: string } }>;
+    };
+    const dismissedTrackId = firstBody.items[0]?.track.id;
+    expect(dismissedTrackId).toBeTruthy();
+
+    const dismiss = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/events/interaction",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        requestId: firstBody.requestId,
+        surface: "stream",
+        position: 0,
+        trackId: dismissedTrackId,
+        action: "dismiss",
+        occurredAt: new Date().toISOString(),
+      },
+    });
+    expect(dismiss.statusCode).toBe(204);
+
+    const secondStream = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        limit: 5,
+        mode: "autoplay",
+      },
+    });
+    expect(secondStream.statusCode).toBe(200);
+
+    const secondBody = secondStream.json() as {
+      items: Array<{ track: { id: string } }>;
+    };
+    expect(secondBody.items.map((item) => item.track.id)).not.toContain(dismissedTrackId);
+  });
+
+  it("ignores the current track and keeps recommendations user-profile driven", async () => {
+    const { body } = await registerUser();
+    const liked = await resolveTrack(body.accessToken, {
+      sourceTrackId: "ignore-current-a1",
+      title: "Velvet Transit",
+      artistName: "Signal Coast",
+      audioUrl: "https://example.invalid/ignore-current-a1.mp3",
+      duration: 207000,
+      musicBrainzArtistId: "mb-ignore-current-a",
+    });
+    const historyPick = await resolveTrack(body.accessToken, {
+      sourceTrackId: "ignore-current-a2",
+      title: "Glass Terminal",
+      artistName: "Signal Coast",
+      audioUrl: "https://example.invalid/ignore-current-a2.mp3",
+      duration: 209000,
+      musicBrainzArtistId: "mb-ignore-current-a",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "ignore-current-a3",
+      title: "Midtown Echo",
+      artistName: "Signal Coast",
+      audioUrl: "https://example.invalid/ignore-current-a3.mp3",
+      duration: 211000,
+      musicBrainzArtistId: "mb-ignore-current-a",
+    });
+    const currentTrack = await resolveTrack(body.accessToken, {
+      sourceTrackId: "ignore-current-b1",
+      title: "Stone Current",
+      artistName: "Harbor Run",
+      audioUrl: "https://example.invalid/ignore-current-b1.mp3",
+      duration: 215000,
+      musicBrainzArtistId: "mb-ignore-current-b",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "ignore-current-b2",
+      title: "Harbor Current",
+      artistName: "Harbor Run",
+      audioUrl: "https://example.invalid/ignore-current-b2.mp3",
+      duration: 218000,
+      musicBrainzArtistId: "mb-ignore-current-b",
+    });
+
+    await app.inject({
+      method: "POST",
+      url: "/me/favorites",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: liked.body.track.id,
+      },
+    });
+    await app.inject({
+      method: "POST",
+      url: "/me/history/events",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: historyPick.body.track.id,
+        eventType: "COMPLETED",
+        playedMs: 200000,
+      },
+    });
+
+    const stream = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        limit: 5,
+        mode: "autoplay",
+        currentTrackId: currentTrack.externalTrackId,
+      },
+    });
+    expect(stream.statusCode).toBe(200);
+
+    const streamBody = stream.json() as {
+      strategy: string;
+      seedLabel: string;
+      seed: { mode: string; canonicalTrackId?: string };
+      items: Array<{ track: { id: string; artist: string } }>;
+    };
+    expect(streamBody.strategy).toBe("user-feed");
+    expect(streamBody.items.length).toBeGreaterThan(0);
+    expect(streamBody.seed.canonicalTrackId).toBeUndefined();
+    expect(streamBody.seedLabel).not.toContain("Stone Current");
+    expect(streamBody.seedLabel).not.toContain("Harbor Run");
+  });
+
+  it("breaks same-artist loops when the user has other strong favorite artists", async () => {
+    const { body } = await registerUser();
+    const loopFavorite = await resolveTrack(body.accessToken, {
+      sourceTrackId: "variety-a1",
+      title: "Neon Repeat",
+      artistName: "Loop Hero",
+      audioUrl: "https://example.invalid/variety-a1.mp3",
+      duration: 204000,
+      musicBrainzArtistId: "mb-variety-a",
+    });
+    const loopRecent = await resolveTrack(body.accessToken, {
+      sourceTrackId: "variety-a2",
+      title: "City Repeat",
+      artistName: "Loop Hero",
+      audioUrl: "https://example.invalid/variety-a2.mp3",
+      duration: 207000,
+      musicBrainzArtistId: "mb-variety-a",
+    });
+    const currentLoop = await resolveTrack(body.accessToken, {
+      sourceTrackId: "variety-a3",
+      title: "Midnight Repeat",
+      artistName: "Loop Hero",
+      audioUrl: "https://example.invalid/variety-a3.mp3",
+      duration: 210000,
+      musicBrainzArtistId: "mb-variety-a",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "variety-a4",
+      title: "Afterimage Repeat",
+      artistName: "Loop Hero",
+      audioUrl: "https://example.invalid/variety-a4.mp3",
+      duration: 214000,
+      musicBrainzArtistId: "mb-variety-a",
+    });
+    const favoriteB = await resolveTrack(body.accessToken, {
+      sourceTrackId: "variety-b1",
+      title: "Parallel Lights",
+      artistName: "Night Arcade",
+      audioUrl: "https://example.invalid/variety-b1.mp3",
+      duration: 206000,
+      musicBrainzArtistId: "mb-variety-b",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "variety-b2",
+      title: "Mirror Skyline",
+      artistName: "Night Arcade",
+      audioUrl: "https://example.invalid/variety-b2.mp3",
+      duration: 211000,
+      musicBrainzArtistId: "mb-variety-b",
+    });
+    const favoriteC = await resolveTrack(body.accessToken, {
+      sourceTrackId: "variety-c1",
+      title: "Soft Horizon",
+      artistName: "Signal Bloom",
+      audioUrl: "https://example.invalid/variety-c1.mp3",
+      duration: 205000,
+      musicBrainzArtistId: "mb-variety-c",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "variety-c2",
+      title: "Open Horizon",
+      artistName: "Signal Bloom",
+      audioUrl: "https://example.invalid/variety-c2.mp3",
+      duration: 212000,
+      musicBrainzArtistId: "mb-variety-c",
+    });
+
+    await app.inject({
+      method: "POST",
+      url: "/me/favorites",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: loopFavorite.body.track.id,
+      },
+    });
+    await app.inject({
+      method: "POST",
+      url: "/me/favorites",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: favoriteB.body.track.id,
+      },
+    });
+    await app.inject({
+      method: "POST",
+      url: "/me/favorites",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: favoriteC.body.track.id,
+      },
+    });
+
+    await app.inject({
+      method: "POST",
+      url: "/me/history/events",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: loopFavorite.body.track.id,
+        eventType: "COMPLETED",
+        playedMs: 198000,
+      },
+    });
+    await app.inject({
+      method: "POST",
+      url: "/me/history/events",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: loopRecent.body.track.id,
+        eventType: "COMPLETED",
+        playedMs: 201000,
+      },
+    });
+
+    const stream = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        limit: 5,
+        mode: "autoplay",
+        currentTrackId: currentLoop.externalTrackId,
+      },
+    });
+    expect(stream.statusCode).toBe(200);
+
+    const streamBody = stream.json() as {
+      strategy: string;
+      items: Array<{ track: { artist: string } }>;
+    };
+    expect(streamBody.strategy).toBe("user-feed");
+    expect(streamBody.items.length).toBeGreaterThan(0);
+    expect(streamBody.items[0]?.track.artist).not.toBe("Loop Hero");
+    expect(["Night Arcade", "Signal Bloom"]).toContain(streamBody.items[0]?.track.artist);
+  });
+
   it("rate limits auth endpoints", async () => {
     const rateLimitedApp = await buildApp({
       config: {
@@ -780,5 +1417,31 @@ describeIfDb("Pingu Music API", () => {
     } finally {
       await rateLimitedApp.close();
     }
+  });
+
+  it("returns 401 instead of crashing when a token points to a deleted user", async () => {
+    const { body } = await registerUser();
+
+    await prisma.user.delete({
+      where: {
+        id: body.user.id,
+      },
+    });
+
+    const stream = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        mode: "autoplay",
+      },
+    });
+
+    expect(stream.statusCode).toBe(401);
+    expect(stream.json()).toMatchObject({
+      statusCode: 401,
+    });
   });
 });

@@ -19,6 +19,17 @@ export function filterScoredCandidates<
   profiles: RecommendationProfiles;
   config: RecommendationConfig;
 }) {
+  const hardSuppressedTrackIds = new Set([
+    ...params.profiles.entity.dislikedTrackIds,
+    ...params.profiles.entity.fastSkippedTrackIds,
+    ...params.profiles.entity.dismissedTrackIds,
+    ...params.profiles.session.recentDislikedTrackIds,
+    ...params.profiles.session.recentFastSkippedTrackIds,
+    ...params.profiles.session.recentDismissedTrackIds,
+    ...(params.context.userFeatures?.negative.hardSuppressedTrackIds ?? []),
+  ]);
+  const temporarilyHiddenTrackIds = new Set(params.context.userFeatures?.negative.temporarilyHiddenTrackIds ?? []);
+
   return params.candidates.filter((candidate) => {
     const track = candidate.__track;
 
@@ -38,11 +49,22 @@ export function filterScoredCandidates<
       return false;
     }
 
-    if (params.profiles.entity.dislikedTrackIds.includes(track.canonicalTrackId)) {
+    if (hardSuppressedTrackIds.has(track.canonicalTrackId)) {
       return false;
     }
 
-    if (params.context.skippedTrackIds.includes(track.canonicalTrackId)) {
+    if (temporarilyHiddenTrackIds.has(track.canonicalTrackId)) {
+      return false;
+    }
+
+    if (
+      params.context.skippedTrackIds.includes(track.canonicalTrackId) ||
+      params.profiles.session.recentSkippedTrackIds.includes(track.canonicalTrackId)
+    ) {
+      return false;
+    }
+
+    if (candidate.scoreBreakdown.finalScore <= 0) {
       return false;
     }
 

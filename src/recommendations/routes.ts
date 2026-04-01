@@ -19,6 +19,14 @@ const recommendationChannelEnum = [
   "releaseEraProximity",
   "sessionContinuation",
   "userAffinityRetrieval",
+  "userTopArtists",
+  "userTopTags",
+  "userTopTracks",
+  "playlistCooccurrence",
+  "sessionTransitions",
+  "searchIntent",
+  "adjacentDiscovery",
+  "safeExploration",
 ] as const;
 
 const nextTrackBodySchema = {
@@ -129,6 +137,87 @@ const dislikeEventBodySchema = {
   },
 } as const;
 
+const onboardingProfileBodySchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    artistIds: {
+      type: "array",
+      minItems: 0,
+      maxItems: 10,
+      items: { type: "string", minLength: 1, maxLength: 255 },
+    },
+    artistNames: {
+      type: "array",
+      minItems: 0,
+      maxItems: 10,
+      items: { type: "string", minLength: 1, maxLength: 255 },
+    },
+    tags: {
+      type: "array",
+      minItems: 0,
+      maxItems: 10,
+      items: { type: "string", minLength: 1, maxLength: 255 },
+    },
+    languages: {
+      type: "array",
+      minItems: 0,
+      maxItems: 10,
+      items: { type: "string", minLength: 1, maxLength: 64 },
+    },
+    discoveryLevel: {
+      type: "string",
+      enum: ["safe", "balanced", "exploratory"],
+    },
+  },
+} as const;
+
+const impressionsEventBodySchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["items"],
+  properties: {
+    items: {
+      type: "array",
+      minItems: 1,
+      maxItems: 100,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["requestId", "surface", "position", "trackId", "occurredAt"],
+        properties: {
+          requestId: { type: "string", minLength: 1, maxLength: 255 },
+          surface: { type: "string", minLength: 1, maxLength: 255 },
+          position: { type: "integer", minimum: 0, maximum: 1000 },
+          trackId: { type: "string", minLength: 1, maxLength: 255 },
+          occurredAt: { type: "string", minLength: 1, maxLength: 255 },
+        },
+      },
+    },
+  },
+} as const;
+
+const interactionEventBodySchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["requestId", "surface", "position", "trackId", "action", "occurredAt"],
+  properties: {
+    requestId: { type: "string", minLength: 1, maxLength: 255 },
+    surface: { type: "string", minLength: 1, maxLength: 255 },
+    position: { type: "integer", minimum: 0, maximum: 1000 },
+    trackId: { type: "string", minLength: 1, maxLength: 255 },
+    action: {
+      type: "string",
+      enum: ["open", "play", "skip", "queue", "dismiss", "favorite", "playlist_add"],
+    },
+    occurredAt: { type: "string", minLength: 1, maxLength: 255 },
+    listenedMs: { type: "integer", minimum: 0 },
+    trackDurationMs: { type: "integer", minimum: 0 },
+    playlistId: { type: "string", minLength: 1, maxLength: 255 },
+    metadata: { type: ["object", "null"] },
+  },
+} as const;
+
 // Future backend extraction point: this is the transport layer over the pure recommendation domain.
 export const recommendationsRoutes: FastifyPluginAsync = async (app) => {
   app.post(
@@ -168,6 +257,24 @@ export const recommendationsRoutes: FastifyPluginAsync = async (app) => {
   );
 
   app.post(
+    "/me/recommendations/onboarding-profile",
+    {
+      preHandler: [app.authenticate],
+      schema: {
+        body: onboardingProfileBodySchema,
+      },
+    },
+    async (request) =>
+      recommendationService.saveOnboardingProfile(app.prisma, request.authUser!.userId, request.body as {
+        artistIds?: string[];
+        artistNames?: string[];
+        tags?: string[];
+        languages?: string[];
+        discoveryLevel?: "safe" | "balanced" | "exploratory";
+      }),
+  );
+
+  app.post(
     "/me/recommendations/events/playback",
     {
       preHandler: [app.authenticate],
@@ -188,6 +295,63 @@ export const recommendationsRoutes: FastifyPluginAsync = async (app) => {
           wasSkipped: boolean;
           sessionId: string;
           seedChannels?: (typeof recommendationChannelEnum)[number][];
+        },
+      );
+
+      return reply.code(204).send();
+    },
+  );
+
+  app.post(
+    "/me/recommendations/events/impressions",
+    {
+      preHandler: [app.authenticate],
+      schema: {
+        body: impressionsEventBodySchema,
+      },
+    },
+    async (request, reply) => {
+      await recommendationService.recordRecommendationImpressions(
+        app.prisma,
+        request.authUser!.userId,
+        request.body as {
+          items: Array<{
+            requestId: string;
+            surface: string;
+            position: number;
+            trackId: string;
+            occurredAt: string;
+          }>;
+        },
+      );
+
+      return reply.code(204).send();
+    },
+  );
+
+  app.post(
+    "/me/recommendations/events/interaction",
+    {
+      preHandler: [app.authenticate],
+      schema: {
+        body: interactionEventBodySchema,
+      },
+    },
+    async (request, reply) => {
+      await recommendationService.recordRecommendationInteraction(
+        app.prisma,
+        request.authUser!.userId,
+        request.body as {
+          requestId: string;
+          surface: string;
+          position: number;
+          trackId: string;
+          action: "open" | "play" | "skip" | "queue" | "dismiss" | "favorite" | "playlist_add";
+          occurredAt: string;
+          listenedMs?: number;
+          trackDurationMs?: number;
+          playlistId?: string;
+          metadata?: Record<string, unknown> | null;
         },
       );
 
