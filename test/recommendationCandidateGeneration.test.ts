@@ -421,4 +421,56 @@ describe("recommendation candidate generation", () => {
     );
     expect(topThreeIds).not.toContain("track:offgenre");
   });
+
+  it("puts a discovered related artist ahead of more same-artist tracks from favorites", () => {
+    const snapshot = createSnapshot();
+    const context = {
+      mode: "autoplay",
+      currentCanonicalTrackId: null,
+      currentPrimaryArtistId: null,
+      playbackPrimaryArtistId: null,
+      currentFeaturedArtistIds: [],
+      currentTrackTagIds: [],
+      currentArtistTagIds: [],
+      currentReleaseId: null,
+      currentFlavor: null,
+      currentDurationMs: null,
+      recentTrackIds: [],
+      recentArtistIds: [],
+      recentTagCloud: {
+        "tag:synth": 2,
+        "tag:night": 1.5,
+      },
+      recentRecommendationIds: [],
+      skippedTrackIds: [],
+      favoritedTrackIds: ["track:fav"],
+      userFeatures: buildFeatures(),
+    } satisfies RecommendationContext;
+
+    const profiles = createEmptyProfiles();
+    profiles.bootstrap.discoveryLevel = "balanced";
+    profiles.entity.artistAffinities["artist:fav"] = {
+      value: 16,
+      updatedAt: "2026-04-01T00:00:00.000Z",
+      eventCount: 6,
+    };
+    profiles.entity.tagAffinities["tag:synth"] = {
+      value: 7,
+      updatedAt: "2026-04-01T00:00:00.000Z",
+      eventCount: 3,
+    };
+
+    const ranking = getRankedTrackRecommendations({
+      seed: {
+        mode: "autoplay",
+      },
+      context,
+      snapshot,
+      profiles,
+      config: defaultRecommendationConfig,
+    });
+
+    expect(["track:related", "track:collab"]).toContain(ranking[0]?.canonicalTrackId);
+    expect(snapshot.tracksById[ranking[0]!.canonicalTrackId]!.primaryCanonicalArtistId).not.toBe("artist:fav");
+  });
 });

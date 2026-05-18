@@ -7,6 +7,10 @@ import {
   saveProfiles,
 } from "./affinity/profileStore";
 import { defaultRecommendationConfig } from "./config/defaultRecommendationConfig";
+export {
+  calculateOfflineRecommendationMetrics,
+  calculateOnlineRecommendationMetrics,
+} from "./metrics/recommendationMetrics";
 import { getBestNextTrack, getRankedArtistRecommendations, getRankedTrackRecommendations } from "./next-track/getNextRecommendedTrack";
 import {
   RecommendationConfig,
@@ -97,16 +101,6 @@ export function createRecommendationEngine(
         context: enrichedContext,
         results,
       });
-      const surfacedTrackId = results[0]?.canonicalTrackId;
-      if (surfacedTrackId) {
-        profiles.session.recentRecommendationIds = [
-          surfacedTrackId,
-          ...profiles.session.recentRecommendationIds,
-        ]
-          .filter((value, index, list) => list.indexOf(value) === index)
-          .slice(0, 32);
-        await saveProfiles(deps.cacheStore, profiles);
-      }
       return results;
     },
 

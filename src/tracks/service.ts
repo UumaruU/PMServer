@@ -1,6 +1,8 @@
 import type { Prisma, PrismaClient, Track } from "@prisma/client";
 
+import { ingestTrack } from "../discovery/ingestion/ingestTrack";
 import { AppError } from "../utils/errors";
+import { trackDurationToMilliseconds } from "./duration";
 
 type DbClient = PrismaClient | Prisma.TransactionClient;
 
@@ -126,6 +128,35 @@ function toResolvedTrackData(input: ResolvedTrackInput) {
   };
 }
 
+async function ingestResolvedTrackSource(prisma: DbClient, track: Track) {
+  try {
+    await ingestTrack(prisma, {
+      legacyTrackId: track.id,
+      clientTrackId: toExternalTrackId(track),
+      track: {
+        providerId: getProviderIdForClientTrack(track),
+        sourceTrackId: getProviderTrackIdForClientTrack(track),
+        title: track.title,
+        artistName: track.artistName,
+        albumTitle: track.albumTitle,
+        durationMs: trackDurationToMilliseconds(track.duration),
+        coverUrl: track.coverUrl,
+        audioUrl: track.audioUrl,
+        sourceUrl: track.audioUrl,
+        musicBrainzRecordingId: track.musicBrainzRecordingId,
+        musicBrainzArtistId: track.musicBrainzArtistId,
+        musicBrainzReleaseId: track.musicBrainzReleaseId,
+      },
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === "Cannot ingest an empty or invalid external track.") {
+      return;
+    }
+
+    throw error;
+  }
+}
+
 export async function upsertResolvedTrack(prisma: DbClient, input: ResolvedTrackInput): Promise<Track> {
   const data = toResolvedTrackData(input);
   const existingByClientTrackId = data.clientTrackId
@@ -137,12 +168,14 @@ export async function upsertResolvedTrack(prisma: DbClient, input: ResolvedTrack
     : null;
 
   if (existingByClientTrackId) {
-    return prisma.track.update({
+    const track = await prisma.track.update({
       where: {
         id: existingByClientTrackId.id,
       },
       data,
     });
+    await ingestResolvedTrackSource(prisma, track);
+    return track;
   }
 
   const existingBySource = await prisma.track.findUnique({
@@ -155,17 +188,21 @@ export async function upsertResolvedTrack(prisma: DbClient, input: ResolvedTrack
   });
 
   if (existingBySource) {
-    return prisma.track.update({
+    const track = await prisma.track.update({
       where: {
         id: existingBySource.id,
       },
       data,
     });
+    await ingestResolvedTrackSource(prisma, track);
+    return track;
   }
 
-  return prisma.track.create({
+  const track = await prisma.track.create({
     data,
   });
+  await ingestResolvedTrackSource(prisma, track);
+  return track;
 }
 
 export async function upsertResolvedTracks(

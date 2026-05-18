@@ -52,6 +52,30 @@ function countMatchesWithinWindow(values: string[], expected: string | null | un
   return values.slice(0, limit).reduce((count, value) => count + (value === expected ? 1 : 0), 0);
 }
 
+const TITLE_TOKEN_STOPWORDS = new Set([
+  "feat",
+  "ft",
+  "with",
+  "and",
+  "the",
+  "from",
+  "remix",
+  "edit",
+  "radio",
+  "live",
+  "version",
+  "official",
+  "audio",
+  "video",
+]);
+
+function getTitleTokens(track: RecommendationCatalogSnapshot["tracksById"][string] | undefined) {
+  return (track?.normalizedTitleCore ?? "")
+    .split(/[^\p{L}\p{N}]+/u)
+    .map((token) => token.trim().toLowerCase())
+    .filter((token) => token.length >= 4 && !TITLE_TOKEN_STOPWORDS.has(token) && !/^\d+$/.test(token));
+}
+
 function hasMeaningfulArtistAlternatives(context: RecommendationContext) {
   return (context.userFeatures?.topArtists ?? []).filter((entry) => entry.score >= 4).length >= 2;
 }
@@ -113,6 +137,29 @@ function cloneCandidate<T extends { scoreBreakdown: { finalScore: number }; pena
   };
 }
 
+function buildRecentTitleTokenCounts(
+  context: RecommendationContext,
+  snapshot: RecommendationCatalogSnapshot,
+) {
+  return [...context.recentTrackIds, ...(context.recentRecommendationIds ?? [])].reduce<Record<string, number>>(
+    (accumulator, trackId) => {
+      getTitleTokens(snapshot.tracksById[trackId]).forEach((token) => {
+        accumulator[token] = (accumulator[token] ?? 0) + 1;
+      });
+
+      return accumulator;
+    },
+    {},
+  );
+}
+
+function hasFreshTitleTokenAlternative<T extends { __track: RecommendationCatalogSnapshot["tracksById"][string] }>(
+  candidates: T[],
+  titleTokenCounts: Record<string, number>,
+) {
+  return candidates.some((candidate) => getTitleTokens(candidate.__track).every((token) => (titleTokenCounts[token] ?? 0) < 2));
+}
+
 // Pure domain logic: final ordering uses greedy reranking with diversity caps and avoids near-duplicate runs.
 export function applyDiversification<
   T extends {
@@ -135,6 +182,10 @@ export function applyDiversification<
   const baseHasArtistAlternatives = hasMeaningfulArtistAlternatives(params.context);
   const antiRepeatArtistTrail = buildAntiRepeatArtistTrail(params.context, params.snapshot);
   const recentArtistTrail = antiRepeatArtistTrail.slice(0, artistCooldownLookback);
+  const favoriteArtistTrail = (params.context.favoritedTrackIds ?? [])
+    .map((trackId) => params.snapshot.tracksById[trackId]?.primaryCanonicalArtistId ?? null)
+    .filter((artistId): artistId is string => !!artistId);
+  const favoriteArtistIds = new Set(favoriteArtistTrail);
   const artistCounts = antiRepeatArtistTrail
     .slice(0, Math.max(artistCooldownLookback, 6))
     .reduce<Record<string, number>>((accumulator, artistId) => {
@@ -152,7 +203,7 @@ export function applyDiversification<
       accumulator[track.canonicalReleaseId] = (accumulator[track.canonicalReleaseId] ?? 0) + 1;
       return accumulator;
     }, {});
-  const tagCounts = params.context.recentTrackIds
+  const tagCounts = [...params.context.recentTrackIds, ...(params.context.recentRecommendationIds ?? [])]
     .slice(0, 6)
     .reduce<Record<string, number>>((accumulator, trackId) => {
       const track = params.snapshot.tracksById[trackId];
@@ -166,6 +217,7 @@ export function applyDiversification<
 
       return accumulator;
     }, {});
+  const titleTokenCounts = buildRecentTitleTokenCounts(params.context, params.snapshot);
 
   while (remaining.length) {
     const poolOffCooldownArtists = new Set(
@@ -175,6 +227,7 @@ export function applyDiversification<
     );
     const hasPoolArtistAlternatives = poolOffCooldownArtists.size >= 1;
     const hasArtistAlternatives = baseHasArtistAlternatives || hasPoolArtistAlternatives;
+    const hasTitleTokenAlternatives = hasFreshTitleTokenAlternative(remaining, titleTokenCounts);
     let bestIndex = -1;
     let bestScore = Number.NEGATIVE_INFINITY;
 
@@ -185,6 +238,11 @@ export function applyDiversification<
       const currentArtistCount = track.primaryCanonicalArtistId ? artistCounts[track.primaryCanonicalArtistId] ?? 0 : 0;
       const currentReleaseCount = track.canonicalReleaseId ? releaseCounts[track.canonicalReleaseId] ?? 0 : 0;
       const repeatedTagCount = track.tagIds.reduce((max, tagId) => Math.max(max, tagCounts[tagId] ?? 0), 0);
+      const titleTokens = getTitleTokens(track);
+      const repeatedTitleTokenCount = titleTokens.reduce(
+        (max, token) => Math.max(max, titleTokenCounts[token] ?? 0),
+        0,
+      );
       const repeatInterest = strongArtistRepeatInterest(track.primaryCanonicalArtistId, params.profiles, params.context);
       const artistCooldownMatches = countMatchesWithinWindow(
         recentArtistTrail,
@@ -192,9 +250,14 @@ export function applyDiversification<
         artistCooldownLookback,
       );
       const artistCooldownActive = artistCooldownMatches > 0;
+      const isFavoriteArtist = !!track.primaryCanonicalArtistId && favoriteArtistIds.has(track.primaryCanonicalArtistId);
+
+      if (selectedCount === 0 && isFavoriteArtist && hasPoolArtistAlternatives) {
+        continue;
+      }
 
       if (selectedCount < 10) {
-        if (track.primaryCanonicalArtistId && currentArtistCount >= 2) {
+        if (track.primaryCanonicalArtistId && currentArtistCount >= 1 && hasPoolArtistAlternatives) {
           continue;
         }
 
@@ -203,6 +266,10 @@ export function applyDiversification<
         }
 
         if (repeatedTagCount >= 3) {
+          continue;
+        }
+
+        if (repeatedTitleTokenCount >= 2 && hasTitleTokenAlternatives) {
           continue;
         }
       }
@@ -250,6 +317,10 @@ export function applyDiversification<
         extraPenalty += 0.12 * repeatedTagCount;
       }
 
+      if (repeatedTitleTokenCount > 0) {
+        extraPenalty += hasTitleTokenAlternatives ? 0.32 * repeatedTitleTokenCount : 0.08 * repeatedTitleTokenCount;
+      }
+
       if (selectedCount < 5 && looksLikeNearDuplicate(track, selected[selected.length - 2]?.__track)) {
         extraPenalty += 0.5;
       }
@@ -268,6 +339,10 @@ export function applyDiversification<
         const currentArtistCount = track.primaryCanonicalArtistId ? artistCounts[track.primaryCanonicalArtistId] ?? 0 : 0;
         const currentReleaseCount = track.canonicalReleaseId ? releaseCounts[track.canonicalReleaseId] ?? 0 : 0;
         const repeatedTagCount = track.tagIds.reduce((max, tagId) => Math.max(max, tagCounts[tagId] ?? 0), 0);
+        const repeatedTitleTokenCount = getTitleTokens(track).reduce(
+          (max, token) => Math.max(max, titleTokenCounts[token] ?? 0),
+          0,
+        );
         const repeatInterest = strongArtistRepeatInterest(track.primaryCanonicalArtistId, params.profiles, params.context);
         const artistCooldownMatches = countMatchesWithinWindow(
           recentArtistTrail,
@@ -282,7 +357,8 @@ export function applyDiversification<
             : 0) +
           (artistCooldownMatches > 0 ? (hasArtistAlternatives ? 0.45 : 0.08) + Math.max(0, artistCooldownMatches - 1) * 0.05 : 0) +
           (currentReleaseCount > 0 ? 0.08 * currentReleaseCount : 0) +
-          (repeatedTagCount > 0 ? 0.04 * repeatedTagCount : 0);
+          (repeatedTagCount > 0 ? 0.04 * repeatedTagCount : 0) +
+          (repeatedTitleTokenCount > 0 ? (hasTitleTokenAlternatives ? 0.16 : 0.04) * repeatedTitleTokenCount : 0);
         const fallbackScore = candidate.scoreBreakdown.finalScore - fallbackPenalty;
 
         if (fallbackScore > bestScore) {
@@ -301,6 +377,10 @@ export function applyDiversification<
     const artistCount = track.primaryCanonicalArtistId ? artistCounts[track.primaryCanonicalArtistId] ?? 0 : 0;
     const releaseCount = track.canonicalReleaseId ? releaseCounts[track.canonicalReleaseId] ?? 0 : 0;
     const repeatedTagCount = track.tagIds.reduce((max, tagId) => Math.max(max, tagCounts[tagId] ?? 0), 0);
+    const repeatedTitleTokenCount = getTitleTokens(track).reduce(
+      (max, token) => Math.max(max, titleTokenCounts[token] ?? 0),
+      0,
+    );
     const repeatInterest = strongArtistRepeatInterest(track.primaryCanonicalArtistId, params.profiles, params.context);
     const artistCooldownMatches = countMatchesWithinWindow(
       recentArtistTrail,
@@ -317,7 +397,8 @@ export function applyDiversification<
         ? (hasArtistAlternatives ? 1.35 : 0.2) + Math.max(0, artistCooldownMatches - 1) * (hasArtistAlternatives ? 0.2 : 0.05)
         : 0) +
       (releaseCount > 0 ? 0.3 * releaseCount : 0) +
-      (repeatedTagCount > 0 ? 0.12 * repeatedTagCount : 0);
+      (repeatedTagCount > 0 ? 0.12 * repeatedTagCount : 0) +
+      (repeatedTitleTokenCount > 0 ? (hasTitleTokenAlternatives ? 0.32 : 0.08) * repeatedTitleTokenCount : 0);
 
     picked.penaltiesApplied.repetitionPenalty += finalExtraPenalty;
     picked.penaltiesApplied.totalPenalty += finalExtraPenalty;
@@ -340,6 +421,9 @@ export function applyDiversification<
 
     track.tagIds.forEach((tagId) => {
       tagCounts[tagId] = (tagCounts[tagId] ?? 0) + 1;
+    });
+    getTitleTokens(track).forEach((token) => {
+      titleTokenCounts[token] = (titleTokenCounts[token] ?? 0) + 1;
     });
   }
 

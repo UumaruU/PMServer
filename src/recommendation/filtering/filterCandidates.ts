@@ -41,6 +41,18 @@ export function filterScoredCandidates<
       return false;
     }
 
+    if (params.context.favoritedTrackIds.includes(candidate.canonicalTrackId)) {
+      return false;
+    }
+
+    if (params.profiles.session.recentFavoritedTrackIds.includes(candidate.canonicalTrackId)) {
+      return false;
+    }
+
+    if (params.context.recentTrackIds.includes(candidate.canonicalTrackId)) {
+      return false;
+    }
+
     if (!track.preferredVariantId || !track.playableVariantIds.includes(track.preferredVariantId)) {
       return false;
     }
@@ -54,13 +66,6 @@ export function filterScoredCandidates<
     }
 
     if (temporarilyHiddenTrackIds.has(track.canonicalTrackId)) {
-      return false;
-    }
-
-    if (
-      params.context.skippedTrackIds.includes(track.canonicalTrackId) ||
-      params.profiles.session.recentSkippedTrackIds.includes(track.canonicalTrackId)
-    ) {
       return false;
     }
 

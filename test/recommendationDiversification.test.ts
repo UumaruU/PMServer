@@ -5,13 +5,14 @@ import { defaultRecommendationConfig } from "../src/recommendation/config/defaul
 import { applyDiversification } from "../src/recommendation/diversification/applyDiversification";
 import type { RecommendationCatalogSnapshot, RecommendationContext } from "../src/recommendation/types";
 
-function buildTrack(id: string, artistId: string) {
+function buildTrack(id: string, artistId: string, input: { title?: string; tagIds?: string[] } = {}) {
+  const title = input.title ?? id;
   return {
     canonicalTrackId: id,
     primaryCanonicalArtistId: artistId,
     canonicalReleaseId: null,
-    tagIds: [],
-    normalizedTitleCore: id,
+    tagIds: input.tagIds ?? [],
+    normalizedTitleCore: title.toLowerCase(),
     musicBrainzRecordingId: null,
   } as unknown as RecommendationCatalogSnapshot["tracksById"][string];
 }
@@ -233,5 +234,67 @@ describe("recommendation diversification", () => {
 
     expect(diversified[0]?.canonicalTrackId).toBe("track:c");
     expect(diversified[0]?.__track.primaryCanonicalArtistId).not.toBe("artist:a");
+  });
+
+  it("breaks repeated title-token loops when fresh alternatives exist", () => {
+    const snapshot = {
+      tracksById: {
+        "track:night-prev-1": buildTrack("track:night-prev-1", "artist:a", {
+          title: "Night Signal",
+          tagIds: ["tag:night"],
+        }),
+        "track:night-prev-2": buildTrack("track:night-prev-2", "artist:b", {
+          title: "Night Static",
+          tagIds: ["tag:night"],
+        }),
+        "track:night-next": buildTrack("track:night-next", "artist:c", {
+          title: "Night Glass",
+          tagIds: ["tag:night"],
+        }),
+        "track:fresh": buildTrack("track:fresh", "artist:d", {
+          title: "Coastal Light",
+          tagIds: ["tag:coastal"],
+        }),
+      },
+    } as unknown as RecommendationCatalogSnapshot;
+
+    const context = {
+      recentArtistIds: [],
+      recentTrackIds: [],
+      recentRecommendationIds: ["track:night-prev-1", "track:night-prev-2"],
+      userFeatures: {
+        topArtists: [
+          { id: "artist:c", score: 9 },
+          { id: "artist:d", score: 8 },
+        ],
+        topTags: [
+          { id: "tag:night", score: 20 },
+          { id: "tag:coastal", score: 8 },
+        ],
+      },
+    } as unknown as RecommendationContext;
+
+    const diversified = applyDiversification({
+      candidates: [
+        {
+          canonicalTrackId: "track:night-next",
+          scoreBreakdown: { finalScore: 13 },
+          penaltiesApplied: { repetitionPenalty: 0, totalPenalty: 0 },
+          __track: snapshot.tracksById["track:night-next"],
+        },
+        {
+          canonicalTrackId: "track:fresh",
+          scoreBreakdown: { finalScore: 10 },
+          penaltiesApplied: { repetitionPenalty: 0, totalPenalty: 0 },
+          __track: snapshot.tracksById["track:fresh"],
+        },
+      ],
+      snapshot,
+      context,
+      profiles: createEmptyProfiles(),
+      config: defaultRecommendationConfig,
+    });
+
+    expect(diversified[0]?.canonicalTrackId).toBe("track:fresh");
   });
 });

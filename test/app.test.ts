@@ -4,9 +4,27 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app";
 import type { AppConfig } from "../src/config";
 import { createPrismaClient } from "../src/database/prisma";
+import { backfillDiscoveryIndex } from "../src/discovery/backfillDiscoveryIndex";
+import { discoveryService } from "../src/discovery/discovery.service";
+import { ingestTrack } from "../src/discovery/ingestion/ingestTrack";
+import type { DiscoveryProvider } from "../src/discovery/providers/provider.types";
 
-const testDatabaseUrl = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
-const describeIfDb = testDatabaseUrl ? describe : describe.skip;
+const testDatabaseUrl = process.env.TEST_DATABASE_URL;
+
+function isSafeTestDatabaseUrl(value?: string) {
+  if (!value) {
+    return false;
+  }
+
+  try {
+    const databaseName = new URL(value).pathname.replace(/^\//, "").toLowerCase();
+    return databaseName.includes("test");
+  } catch {
+    return false;
+  }
+}
+
+const describeIfDb = isSafeTestDatabaseUrl(testDatabaseUrl) ? describe : describe.skip;
 
 function buildLogin() {
   return `u_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
@@ -28,6 +46,15 @@ describeIfDb("Pingu Music API", () => {
     jwtRefreshExpiresIn: "30d",
     rateLimitMax: 50,
     rateLimitWindow: "1 minute",
+    lastfmApiKey: null,
+    deezerApiBaseUrl: "https://api.deezer.com",
+    listenBrainzApiBaseUrl: "https://api.listenbrainz.org/1",
+    discoveryWorkerEnabled: false,
+    discoveryLiveExpansionEnabled: true,
+    discoveryMaxLiveProviderCalls: 3,
+    discoveryMaxJobsPerTick: 3,
+    discoveryBackfillOnStartup: false,
+    discoveryBackfillBatchSize: 200,
   };
 
   let app: Awaited<ReturnType<typeof buildApp>>;
@@ -43,6 +70,14 @@ describeIfDb("Pingu Music API", () => {
   });
 
   beforeEach(async () => {
+    await prisma.discoveryJob.deleteMany();
+    await prisma.discoverySeed.deleteMany();
+    await prisma.trackEdge.deleteMany();
+    await prisma.artistSimilarity.deleteMany();
+    await prisma.artistSource.deleteMany();
+    await prisma.trackSource.deleteMany();
+    await prisma.artist.deleteMany();
+    await prisma.canonicalTrack.deleteMany();
     await prisma.userRecommendationEvent.deleteMany();
     await prisma.userRecommendationCacheEntry.deleteMany();
     await prisma.userRecommendationProfile.deleteMany();
@@ -55,6 +90,7 @@ describeIfDb("Pingu Music API", () => {
     await prisma.userSettings.deleteMany();
     await prisma.track.deleteMany();
     await prisma.user.deleteMany();
+    discoveryService.resetProvidersForTesting?.();
   });
 
   afterAll(async () => {
@@ -268,6 +304,135 @@ describeIfDb("Pingu Music API", () => {
     expect(secondResolve.response.statusCode).toBe(200);
     expect(secondResolve.body.track.id).toBe(firstResolve.body.track.id);
     expect(secondResolve.body.track.title).toBe("Track title updated");
+  });
+
+  it("indexes resolved source tracks as canonical tracks with playable variants", async () => {
+    const { body } = await registerUser();
+
+    const first = await resolveTrack(body.accessToken, {
+      source: "hitmos",
+      sourceTrackId: "canonical-source-1",
+      title: "Shared Signal",
+      artistName: "Index Artist",
+      audioUrl: "https://example.invalid/canonical-source-1.mp3",
+      duration: 201000,
+      musicBrainzRecordingId: "mb-rec-shared-signal",
+      musicBrainzArtistId: "mb-artist-index",
+    });
+    const duplicate = await resolveTrack(body.accessToken, {
+      source: "lmusic",
+      sourceTrackId: "canonical-source-2",
+      title: "Shared Signal",
+      artistName: "Index Artist",
+      audioUrl: "https://example.invalid/canonical-source-2.mp3",
+      duration: 202000,
+      musicBrainzRecordingId: "mb-rec-shared-signal",
+      musicBrainzArtistId: "mb-artist-index",
+    });
+
+    expect(first.response.statusCode).toBe(200);
+    expect(duplicate.response.statusCode).toBe(200);
+
+    const canonicalTracks = await prisma.canonicalTrack.findMany({
+      include: {
+        sources: true,
+        artists: true,
+      },
+    });
+    expect(canonicalTracks).toHaveLength(1);
+    expect(canonicalTracks[0]!.musicBrainzRecordingId).toBe("mb-rec-shared-signal");
+    expect(canonicalTracks[0]!.sources).toHaveLength(2);
+    expect(canonicalTracks[0]!.sources.every((source) => !!source.audioUrl)).toBe(true);
+    expect(canonicalTracks[0]!.artists[0]?.musicBrainzArtistId).toBe("mb-artist-index");
+  });
+
+  it("reuses client-sync placeholders when discovery resolves the real playable source", async () => {
+    const placeholder = await createTrack({
+      source: "client-sync",
+      sourceTrackId: "hitmos:collision-track",
+      clientTrackId: "hitmos:collision-track",
+      title: "collision-track",
+      artistName: "Unknown Artist",
+      audioUrl: null,
+      duration: null,
+    });
+
+    const ingested = await ingestTrack(prisma, {
+      track: {
+        providerId: "hitmos",
+        sourceTrackId: "collision-track",
+        title: "Collision Track",
+        artistName: "Resolved Artist",
+        durationMs: 204000,
+        audioUrl: "https://example.invalid/collision-track.mp3",
+        coverUrl: "https://example.invalid/collision-track.jpg",
+      },
+    });
+
+    const tracks = await prisma.track.findMany({
+      orderBy: {
+        createdAt: "asc",
+      },
+    });
+    expect(tracks).toHaveLength(1);
+    expect(tracks[0]!.id).toBe(placeholder.id);
+    expect(tracks[0]!.source).toBe("hitmos");
+    expect(tracks[0]!.sourceTrackId).toBe("collision-track");
+    expect(tracks[0]!.clientTrackId).toBe("hitmos:collision-track");
+    expect(tracks[0]!.duration).toBe(204);
+
+    const source = await prisma.trackSource.findUnique({
+      where: {
+        id: ingested.source.id,
+      },
+    });
+    expect(source?.legacyTrackId).toBe(placeholder.id);
+    expect(source?.clientTrackId).toBe("hitmos:collision-track");
+  });
+
+  it("keeps resolve-many compatible when a synced track is not eligible for the discovery index", async () => {
+    const { body } = await registerUser();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/me/tracks/resolve-many",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        tracks: [
+          {
+            clientTrackId: "hitmos:short-preview",
+            source: "hitmos",
+            sourceTrackId: "short-preview",
+            title: "Short Preview",
+            artistName: "Preview Artist",
+            duration: 12_000,
+            audioUrl: "https://example.invalid/short-preview.mp3",
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect((response.json() as { count: number }).count).toBe(1);
+
+    const legacyTrack = await prisma.track.findUnique({
+      where: {
+        clientTrackId: "hitmos:short-preview",
+      },
+    });
+    expect(legacyTrack?.title).toBe("Short Preview");
+
+    const indexedSource = await prisma.trackSource.findUnique({
+      where: {
+        providerId_sourceTrackId: {
+          providerId: "hitmos",
+          sourceTrackId: "short-preview",
+        },
+      },
+    });
+    expect(indexedSource).toBeNull();
   });
 
   it("adds and removes favorites while rejecting duplicates", async () => {
@@ -663,6 +828,24 @@ describeIfDb("Pingu Music API", () => {
       duration: 215000,
       musicBrainzArtistId: "mb-artist-1",
     });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "rec-track-4",
+      title: "Parallel Signal",
+      artistName: "Aurora Lines",
+      audioUrl: "https://example.invalid/rec-track-4.mp3",
+      duration: 212000,
+      musicBrainzArtistId: "mb-artist-2",
+    });
+    await prisma.artistSimilarity.create({
+      data: {
+        sourceArtistId: "artist:mb-artist-1",
+        targetArtistId: "artist:mb-artist-2",
+        providerId: "test",
+        score: 0.92,
+        confidence: 0.9,
+        reason: "test-related-artist",
+      },
+    });
 
     const favorite = await app.inject({
       method: "POST",
@@ -735,6 +918,642 @@ describeIfDb("Pingu Music API", () => {
 
     expect(await prisma.userRecommendationProfile.findUnique({ where: { userId: body.user.id } })).not.toBeNull();
     expect(await prisma.userRecommendationEvent.count({ where: { userId: body.user.id } })).toBeGreaterThan(0);
+  });
+
+  it("creates discovery seeds and jobs from positive favorite affinity events", async () => {
+    const { body } = await registerUser();
+    const favoriteTrack = await resolveTrack(body.accessToken, {
+      sourceTrackId: "discovery-favorite-seed",
+      title: "Seed Lights",
+      artistName: "Seed Artist",
+      audioUrl: "https://example.invalid/discovery-favorite-seed.mp3",
+      duration: 205000,
+      musicBrainzRecordingId: "mb-rec-seed-lights",
+      musicBrainzArtistId: "mb-artist-seed",
+    });
+
+    const favoriteEvent = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/events/favorite",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: favoriteTrack.externalTrackId,
+        occurredAt: new Date().toISOString(),
+        isFavorite: true,
+      },
+    });
+
+    expect(favoriteEvent.statusCode).toBe(204);
+
+    const seeds = await prisma.discoverySeed.findMany({
+      where: {
+        userId: body.user.id,
+      },
+      include: {
+        jobs: true,
+      },
+      orderBy: {
+        reason: "asc",
+      },
+    });
+    expect(seeds.map((seed) => seed.reason)).toEqual(expect.arrayContaining(["favorite", "favorite_artist"]));
+    const trackSeed = seeds.find((seed) => seed.reason === "favorite");
+    const artistSeed = seeds.find((seed) => seed.reason === "favorite_artist");
+    expect(trackSeed?.canonicalTrackId).toBe("mbrec:mb-rec-seed-lights");
+    expect(trackSeed?.jobs.map((job) => job.jobType)).toEqual(
+      expect.arrayContaining(["enrich_track_metadata", "find_similar_artists", "resolve_artist", "resolve_playable_variants"]),
+    );
+    expect(artistSeed?.artistId).toBeTruthy();
+    expect(artistSeed?.jobs.map((job) => job.jobType)).toEqual(
+      expect.arrayContaining([
+        "find_similar_artists",
+        "fetch_related_artist_top_tracks",
+        "fetch_artist_top_tracks",
+        "fetch_artist_latest_releases",
+      ]),
+    );
+  });
+
+  it("indexes frontend-synced tracks with second-based durations into discovery entities", async () => {
+    const { body } = await registerUser();
+    const synced = await app.inject({
+      method: "POST",
+      url: "/me/tracks/resolve-many",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        tracks: [
+          {
+            clientTrackId: "hitmos:second-duration-track",
+            source: "hitmos",
+            sourceTrackId: "second-duration-track",
+            title: "Second Duration",
+            artistName: "Duration Artist",
+            duration: 205,
+            audioUrl: "https://example.invalid/second-duration-track.mp3",
+            coverUrl: "https://example.invalid/second-duration-track.jpg",
+          },
+        ],
+      },
+    });
+
+    expect(synced.statusCode).toBe(200);
+    expect(await prisma.canonicalTrack.count()).toBe(1);
+    expect(await prisma.trackSource.count()).toBe(1);
+    expect(await prisma.artist.count()).toBe(1);
+    const source = await prisma.trackSource.findFirstOrThrow();
+    expect(source.durationMs).toBe(205000);
+    expect(source.isPlayable).toBe(true);
+  });
+
+  it("backfills legacy tracks and existing user signals into discovery index", async () => {
+    const { body } = await registerUser();
+    const track = await createTrack({
+      source: "hitmos",
+      sourceTrackId: "legacy-backfill-track",
+      clientTrackId: "hitmos:legacy-backfill-track",
+      title: "Legacy Backfill",
+      artistName: "Legacy Artist",
+      duration: 203,
+      audioUrl: "https://example.invalid/legacy-backfill-track.mp3",
+    });
+    await prisma.favorite.create({
+      data: {
+        userId: body.user.id,
+        trackId: track.id,
+      },
+    });
+    await prisma.userHistoryEvent.create({
+      data: {
+        userId: body.user.id,
+        trackId: track.id,
+        eventType: "COMPLETED",
+        playedMs: 190000,
+      },
+    });
+
+    const result = await backfillDiscoveryIndex({
+      prisma,
+      batchSize: 25,
+    });
+
+    expect(result.tracksIndexed).toBe(1);
+    expect(result.tracksSkipped).toBe(0);
+    expect(await prisma.canonicalTrack.count()).toBe(1);
+    expect(await prisma.trackSource.count()).toBe(1);
+    expect(await prisma.artist.count()).toBe(1);
+    expect(await prisma.discoverySeed.count({ where: { userId: body.user.id } })).toBeGreaterThanOrEqual(2);
+    expect(await prisma.discoveryJob.count()).toBeGreaterThan(0);
+  });
+
+  it("processes discovery jobs by ingesting related artist playable tracks", async () => {
+    const { body } = await registerUser();
+    const seedTrack = await resolveTrack(body.accessToken, {
+      sourceTrackId: "discovery-job-seed",
+      title: "Anchor Pulse",
+      artistName: "Anchor Artist",
+      audioUrl: "https://example.invalid/discovery-job-seed.mp3",
+      duration: 204000,
+      musicBrainzRecordingId: "mb-rec-anchor-pulse",
+      musicBrainzArtistId: "mb-artist-anchor",
+    });
+    const fakeProvider: DiscoveryProvider = {
+      providerId: "fake-discovery",
+      async getSimilarArtists() {
+        return [
+          {
+            providerId: "fake-discovery",
+            sourceArtistId: "similar-artist",
+            name: "Similar Artist",
+            musicBrainzArtistId: "mb-artist-similar",
+            score: 0.92,
+            tags: ["synth"],
+          },
+        ];
+      },
+      async getArtistTopTracks() {
+        return [
+          {
+            providerId: "fake-discovery",
+            sourceTrackId: "related-candidate",
+            title: "Related Signal",
+            artistName: "Similar Artist",
+            durationMs: 206000,
+            musicBrainzArtistId: "mb-artist-similar",
+            tags: ["synth"],
+          },
+        ];
+      },
+      async searchTracks(query) {
+        if (!query.includes("Related Signal")) {
+          return [];
+        }
+
+        return [
+          {
+            providerId: "hitmos",
+            sourceTrackId: "playable-related-candidate",
+            title: "Related Signal",
+            artistName: "Similar Artist",
+            durationMs: 206000,
+            audioUrl: "https://example.invalid/playable-related-candidate.mp3",
+            sourceUrl: "https://example.invalid/playable-related-candidate",
+            musicBrainzArtistId: "mb-artist-similar",
+            tags: ["synth"],
+          },
+        ];
+      },
+    };
+
+    discoveryService.setProvidersForTesting?.([fakeProvider]);
+    await app.inject({
+      method: "POST",
+      url: "/me/recommendations/events/favorite",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: seedTrack.externalTrackId,
+        occurredAt: new Date().toISOString(),
+        isFavorite: true,
+      },
+    });
+
+    const processed = await discoveryService.processNextDiscoveryJob(app.prisma);
+
+    expect(processed?.status).toBe("COMPLETED");
+
+    const relatedTrack = await prisma.canonicalTrack.findFirst({
+      where: {
+        title: "Related Signal",
+      },
+      include: {
+        sources: true,
+        artists: true,
+      },
+    });
+    expect(relatedTrack?.artists[0]?.name).toBe("Similar Artist");
+    expect(relatedTrack?.sources.some((source) => source.providerId === "hitmos" && !!source.audioUrl)).toBe(true);
+  });
+
+  it("runs bounded live expansion when the recommendation candidate pool is empty", async () => {
+    const { body } = await registerUser();
+    const onlyKnownTrack = await resolveTrack(body.accessToken, {
+      sourceTrackId: "live-expansion-seed",
+      title: "Lonely Anchor",
+      artistName: "Live Seed",
+      audioUrl: "https://example.invalid/live-expansion-seed.mp3",
+      duration: 203000,
+      musicBrainzRecordingId: "mb-rec-live-seed",
+      musicBrainzArtistId: "mb-artist-live-seed",
+    });
+    const fakeProvider: DiscoveryProvider = {
+      providerId: "fake-live",
+      async getSimilarArtists() {
+        return [
+          {
+            providerId: "fake-live",
+            sourceArtistId: "live-neighbor",
+            name: "Live Neighbor",
+            musicBrainzArtistId: "mb-artist-live-neighbor",
+            score: 0.9,
+            tags: ["dream pop"],
+          },
+        ];
+      },
+      async getArtistTopTracks() {
+        return [
+          {
+            providerId: "fake-live",
+            sourceTrackId: "live-neighbor-track",
+            title: "New Horizon",
+            artistName: "Live Neighbor",
+            durationMs: 207000,
+            musicBrainzArtistId: "mb-artist-live-neighbor",
+            tags: ["dream pop"],
+          },
+        ];
+      },
+      async searchTracks() {
+        return [
+          {
+            providerId: "hitmos",
+            sourceTrackId: "new-horizon-playable",
+            title: "New Horizon",
+            artistName: "Live Neighbor",
+            durationMs: 207000,
+            audioUrl: "https://example.invalid/new-horizon-playable.mp3",
+            sourceUrl: "https://example.invalid/new-horizon-playable",
+            musicBrainzArtistId: "mb-artist-live-neighbor",
+            tags: ["dream pop"],
+          },
+        ];
+      },
+    };
+
+    discoveryService.setProvidersForTesting?.([fakeProvider]);
+    await app.inject({
+      method: "POST",
+      url: "/me/recommendations/events/favorite",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: onlyKnownTrack.externalTrackId,
+        occurredAt: new Date().toISOString(),
+        isFavorite: true,
+      },
+    });
+
+    const stream = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        mode: "autoplay",
+      },
+    });
+
+    expect(stream.statusCode).toBe(200);
+    const streamBody = stream.json() as {
+      contextSummary: string;
+      items: Array<{ track: { id: string; artist: string; title: string; duration: number } }>;
+    };
+    expect(streamBody.contextSummary).toMatch(/expansion|discovery/i);
+    expect(streamBody.items[0]?.track.title).toBe("New Horizon");
+    expect(streamBody.items[0]?.track.artist).toBe("Live Neighbor");
+    expect(streamBody.items[0]?.track.duration).toBe(207);
+    expect(streamBody.items[0]?.track.id).not.toBe(onlyKnownTrack.externalTrackId);
+  });
+
+  it("does not alternate null next-track responses for the same pending wave", async () => {
+    const { body } = await registerUser();
+    const seedTrack = await resolveTrack(body.accessToken, {
+      sourceTrackId: "steady-next-seed",
+      title: "North Static",
+      artistName: "Harbor Wire",
+      audioUrl: "https://example.invalid/steady-next-seed.mp3",
+      duration: 204000,
+      musicBrainzRecordingId: "mb-rec-steady-next-seed",
+      musicBrainzArtistId: "mb-artist-steady-next-seed",
+    });
+    const similarProvider: DiscoveryProvider = {
+      providerId: "lastfm",
+      async getSimilarArtists() {
+        return [
+          {
+            providerId: "lastfm",
+            sourceArtistId: "steady-neighbor",
+            name: "Cinder Avenue",
+            musicBrainzArtistId: "mb-artist-steady-neighbor",
+            score: 0.9,
+            tags: ["indie"],
+          },
+        ];
+      },
+      async getArtistTopTracks() {
+        return [
+          {
+            providerId: "lastfm",
+            sourceTrackId: "steady-neighbor-candidate",
+            title: "Silver Wake",
+            artistName: "Cinder Avenue",
+            durationMs: 206000,
+            musicBrainzArtistId: "mb-artist-steady-neighbor",
+            tags: ["indie"],
+          },
+        ];
+      },
+    };
+    const playableProvider: DiscoveryProvider = {
+      providerId: "hitmos",
+      async searchTracks() {
+        return [
+          {
+            providerId: "hitmos",
+            sourceTrackId: "steady-neighbor-playable",
+            title: "Silver Wake",
+            artistName: "Cinder Avenue",
+            durationMs: 206000,
+            audioUrl: "https://example.invalid/steady-neighbor-playable.mp3",
+            sourceUrl: "https://example.invalid/steady-neighbor-playable",
+            musicBrainzArtistId: "mb-artist-steady-neighbor",
+            tags: ["indie"],
+          },
+        ];
+      },
+    };
+
+    discoveryService.setProvidersForTesting?.([similarProvider, playableProvider]);
+    await app.inject({
+      method: "POST",
+      url: "/me/recommendations/events/favorite",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: seedTrack.externalTrackId,
+        occurredAt: new Date().toISOString(),
+        isFavorite: true,
+      },
+    });
+
+    const first = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/next-track",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        currentTrackId: seedTrack.externalTrackId,
+        mode: "autoplay",
+      },
+    });
+    expect(first.statusCode).toBe(200);
+    const firstBody = first.json() as { preferredVariantId: string; canonicalTrackId: string };
+    expect(firstBody.preferredVariantId).toBe("hitmos:steady-neighbor-playable");
+
+    const second = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/next-track",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        currentTrackId: seedTrack.externalTrackId,
+        mode: "autoplay",
+      },
+    });
+    expect(second.statusCode).toBe(200);
+    const secondBody = second.json() as { preferredVariantId: string; canonicalTrackId: string };
+    expect(secondBody.preferredVariantId).toBe(firstBody.preferredVariantId);
+    expect(secondBody.canonicalTrackId).toBe(firstBody.canonicalTrackId);
+  });
+
+  it("uses Deezer as a metadata candidate source but resolves playback from full-track providers", async () => {
+    const { body } = await registerUser();
+    const seedTrack = await resolveTrack(body.accessToken, {
+      sourceTrackId: "deezer-seed-track",
+      title: "Anchor Color",
+      artistName: "Signal Bloom",
+      audioUrl: "https://example.invalid/deezer-seed-track.mp3",
+      duration: 204000,
+      musicBrainzRecordingId: "mb-rec-deezer-seed-track",
+      musicBrainzArtistId: "mb-artist-deezer-seed",
+    });
+    const similarProvider: DiscoveryProvider = {
+      providerId: "lastfm",
+      async getSimilarArtists() {
+        return [
+          {
+            providerId: "lastfm",
+            sourceArtistId: "deezer-neighbor",
+            name: "Mirror Youth",
+            musicBrainzArtistId: "mb-artist-mirror-youth",
+            score: 0.91,
+            tags: ["indie pop"],
+          },
+        ];
+      },
+    };
+    const deezerProvider: DiscoveryProvider = {
+      providerId: "deezer",
+      async getArtistTopTracks() {
+        return [
+          {
+            providerId: "deezer",
+            sourceTrackId: "deezer-preview-track",
+            title: "Glass Echo",
+            artistName: "Mirror Youth",
+            durationMs: 206000,
+            audioUrl: "https://cdn.deezer.invalid/preview.mp3",
+            sourceUrl: "https://www.deezer.com/track/preview-track",
+            musicBrainzArtistId: "mb-artist-mirror-youth",
+            tags: ["indie pop"],
+          },
+        ];
+      },
+    };
+    const playableProvider: DiscoveryProvider = {
+      providerId: "hitmos",
+      async searchTracks(query) {
+        expect(query).toContain("Mirror Youth");
+        expect(query).toContain("Glass Echo");
+
+        return [
+          {
+            providerId: "hitmos",
+            sourceTrackId: "glass-echo-full",
+            title: "Mirror Youth - Glass Echo",
+            artistName: "Mirror Youth",
+            durationMs: 208000,
+            audioUrl: "https://example.invalid/glass-echo-full.mp3",
+            sourceUrl: "https://example.invalid/glass-echo-full",
+            musicBrainzArtistId: "mb-artist-mirror-youth",
+            tags: ["indie pop"],
+          },
+        ];
+      },
+    };
+
+    discoveryService.setProvidersForTesting?.([similarProvider, deezerProvider, playableProvider]);
+    await app.inject({
+      method: "POST",
+      url: "/me/recommendations/events/favorite",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: seedTrack.externalTrackId,
+        occurredAt: new Date().toISOString(),
+        isFavorite: true,
+      },
+    });
+
+    const stream = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        mode: "autoplay",
+      },
+    });
+
+    expect(stream.statusCode).toBe(200);
+    const streamBody = stream.json() as {
+      items: Array<{ track: { id: string; duration: number; audioUrl: string } }>;
+    };
+    expect(streamBody.items[0]?.track.id).toBe("hitmos:glass-echo-full");
+    expect(streamBody.items[0]?.track.duration).toBe(208);
+    expect(streamBody.items[0]?.track.audioUrl).toContain("glass-echo-full.mp3");
+
+    const deezerSource = await prisma.trackSource.findUnique({
+      where: {
+        providerId_sourceTrackId: {
+          providerId: "deezer",
+          sourceTrackId: "deezer-preview-track",
+        },
+      },
+    });
+    expect(deezerSource?.isPlayable).toBe(false);
+  });
+
+  it("expands beyond favorite artists when the playable pool is only same-artist tracks", async () => {
+    const { body } = await registerUser();
+    const favorite = await resolveTrack(body.accessToken, {
+      sourceTrackId: "same-artist-pool-fav",
+      title: "Favorite Signal",
+      artistName: "Looping Favorite",
+      audioUrl: "https://example.invalid/same-artist-pool-fav.mp3",
+      duration: 203000,
+      musicBrainzRecordingId: "mb-rec-same-artist-pool-fav",
+      musicBrainzArtistId: "mb-artist-same-artist-pool",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "same-artist-pool-2",
+      title: "More Familiar",
+      artistName: "Looping Favorite",
+      audioUrl: "https://example.invalid/same-artist-pool-2.mp3",
+      duration: 205000,
+      musicBrainzArtistId: "mb-artist-same-artist-pool",
+    });
+    await resolveTrack(body.accessToken, {
+      sourceTrackId: "same-artist-pool-3",
+      title: "Still Familiar",
+      artistName: "Looping Favorite",
+      audioUrl: "https://example.invalid/same-artist-pool-3.mp3",
+      duration: 208000,
+      musicBrainzArtistId: "mb-artist-same-artist-pool",
+    });
+
+    const similarProvider: DiscoveryProvider = {
+      providerId: "lastfm",
+      async getSimilarArtists() {
+        return [
+          {
+            providerId: "lastfm",
+            sourceArtistId: "fresh-artist",
+            name: "Fresh Neighbor",
+            musicBrainzArtistId: "mb-artist-fresh-neighbor",
+            score: 0.93,
+            tags: ["synth"],
+          },
+        ];
+      },
+      async getArtistTopTracks() {
+        return [
+          {
+            providerId: "lastfm",
+            sourceTrackId: "fresh-neighbor-candidate",
+            title: "Outside Orbit",
+            artistName: "Fresh Neighbor",
+            durationMs: 206000,
+            musicBrainzArtistId: "mb-artist-fresh-neighbor",
+            tags: ["synth"],
+          },
+        ];
+      },
+    };
+    const playableProvider: DiscoveryProvider = {
+      providerId: "hitmos",
+      async searchTracks(query) {
+        expect(query).toContain("Outside Orbit");
+        return [
+          {
+            providerId: "hitmos",
+            sourceTrackId: "outside-orbit-playable",
+            title: "Outside Orbit",
+            artistName: "Fresh Neighbor",
+            durationMs: 206000,
+            audioUrl: "https://example.invalid/outside-orbit-playable.mp3",
+            sourceUrl: "https://example.invalid/outside-orbit-playable",
+            musicBrainzArtistId: "mb-artist-fresh-neighbor",
+            tags: ["synth"],
+          },
+        ];
+      },
+    };
+
+    discoveryService.setProvidersForTesting?.([similarProvider, playableProvider]);
+    await app.inject({
+      method: "POST",
+      url: "/me/recommendations/events/favorite",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        trackId: favorite.externalTrackId,
+        occurredAt: new Date().toISOString(),
+        isFavorite: true,
+      },
+    });
+
+    const stream = await app.inject({
+      method: "POST",
+      url: "/me/recommendations/stream",
+      headers: {
+        authorization: `Bearer ${body.accessToken}`,
+      },
+      payload: {
+        mode: "autoplay",
+      },
+    });
+
+    expect(stream.statusCode).toBe(200);
+    const streamBody = stream.json() as {
+      contextSummary: string;
+      items: Array<{ track: { artist: string; title: string } }>;
+    };
+    expect(streamBody.contextSummary).toMatch(/expansion|discovery/i);
+    expect(streamBody.items[0]?.track.title).toBe("Outside Orbit");
+    expect(streamBody.items[0]?.track.artist).toBe("Fresh Neighbor");
   });
 
   it("builds a personalized user feed without requiring a current track", async () => {

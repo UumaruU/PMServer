@@ -28,6 +28,32 @@ enum RecommendationEventType {
   DISLIKE
   IMPRESSION
   INTERACTION
+  PLAY
+  SKIP
+  SEEK
+  LIKE
+  SAVE
+  ADD_TO_PLAYLIST
+  SHARE
+}
+
+enum TrackIndexStatus {
+  RAW
+  CANDIDATE
+  PENDING
+  ACTIVE
+  TRUSTED
+  REJECTED
+  BLOCKED
+  MERGED
+  DISABLED
+}
+
+enum DiscoveryJobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
 }
 
 model User {
@@ -49,6 +75,7 @@ model User {
   recommendationProfile  UserRecommendationProfile?
   recommendationCache    UserRecommendationCacheEntry[]
   recommendationEvents   UserRecommendationEvent[]
+  discoverySeeds         DiscoverySeed[]
 }
 
 model RefreshToken {
@@ -84,8 +111,238 @@ model Track {
   playlistTracks         PlaylistTrack[]
   historyEvents          UserHistoryEvent[]
   recommendationEvents   UserRecommendationEvent[]
+  indexedSource          TrackSource?
+  discoverySeeds         DiscoverySeed[]
 
   @@unique([source, sourceTrackId])
+}
+
+model CanonicalTrack {
+  id                     String           @id
+  title                  String
+  artistName             String
+  albumTitle             String?
+  normalizedTitle        String
+  normalizedArtist       String
+  durationMs             Int?
+  coverUrl               String?
+  releaseDate            String?
+  musicBrainzRecordingId String?
+  musicBrainzArtistId    String?
+  musicBrainzReleaseId   String?
+  musicBrainzReleaseGroupId String?
+  isrc                   String?
+  titleFlavor            String[]         @default([])
+  tags                   String[]         @default([])
+  qualityScore           Float            @default(0.5)
+  matchConfidence        Float            @default(0.5)
+  indexStatus            TrackIndexStatus @default(CANDIDATE)
+  discoveredFrom         String?
+  lastIndexedAt          DateTime?
+  lastProviderCheckAt    DateTime?
+  lastSeenAt             DateTime?
+  metadataFreshness      Float            @default(0)
+  playableSourceFreshness Float           @default(0)
+  createdAt              DateTime         @default(now())
+  updatedAt              DateTime         @updatedAt
+  sources                TrackSource[]
+  artists                Artist[]
+  sourceEdges            TrackEdge[]      @relation("TrackEdgeSource")
+  targetEdges            TrackEdge[]      @relation("TrackEdgeTarget")
+  discoverySeeds         DiscoverySeed[]
+
+  @@index([musicBrainzRecordingId])
+  @@index([isrc])
+  @@index([normalizedTitle, normalizedArtist])
+  @@index([indexStatus, updatedAt])
+}
+
+model TrackSource {
+  id                     String           @id @default(uuid()) @db.Uuid
+  canonicalTrackId       String
+  legacyTrackId          String?          @unique @db.Uuid
+  clientTrackId          String?          @unique
+  providerId             String
+  sourceTrackId          String
+  title                  String
+  artistName             String
+  albumTitle             String?
+  durationMs             Int?
+  coverUrl               String?
+  audioUrl               String?
+  sourceUrl              String?
+  musicBrainzRecordingId String?
+  musicBrainzArtistId    String?
+  musicBrainzReleaseId   String?
+  musicBrainzReleaseGroupId String?
+  isrc                   String?
+  tags                   String[]         @default([])
+  isPlayable             Boolean          @default(false)
+  qualityScore           Float            @default(0.5)
+  matchConfidence        Float            @default(0.5)
+  indexStatus            TrackIndexStatus @default(CANDIDATE)
+  discoveredFrom         String?
+  lastIndexedAt          DateTime?
+  lastProviderCheckAt    DateTime?
+  lastSeenAt             DateTime?
+  metadataFreshness      Float            @default(0)
+  playableSourceFreshness Float           @default(0)
+  createdAt              DateTime         @default(now())
+  updatedAt              DateTime         @updatedAt
+  canonicalTrack         CanonicalTrack   @relation(fields: [canonicalTrackId], references: [id], onDelete: Cascade)
+  legacyTrack            Track?           @relation(fields: [legacyTrackId], references: [id], onDelete: SetNull)
+
+  @@unique([providerId, sourceTrackId])
+  @@index([canonicalTrackId])
+  @@index([providerId])
+  @@index([isPlayable, indexStatus])
+}
+
+model Artist {
+  id                  String             @id
+  name                String
+  normalizedName      String
+  musicBrainzArtistId String?
+  type                String?
+  country             String?
+  area                String?
+  imageUrl            String?
+  tags                String[]           @default([])
+  qualityScore        Float              @default(0.5)
+  lastIndexedAt       DateTime?
+  lastProviderCheckAt DateTime?
+  lastSeenAt          DateTime?
+  metadataFreshness   Float              @default(0)
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+  tracks              CanonicalTrack[]
+  sources             ArtistSource[]
+  similarArtists      ArtistSimilarity[] @relation("SimilarityFrom")
+  similarTo           ArtistSimilarity[] @relation("SimilarityTo")
+  discoverySeeds      DiscoverySeed[]
+  trackEdges          TrackEdge[]
+
+  @@index([musicBrainzArtistId])
+  @@index([normalizedName])
+}
+
+model ArtistSource {
+  id                  String   @id @default(uuid()) @db.Uuid
+  artistId            String
+  providerId          String
+  sourceArtistId      String
+  name                String
+  musicBrainzArtistId String?
+  url                 String?
+  tags                String[] @default([])
+  trustScore          Float    @default(0.5)
+  lastIndexedAt       DateTime?
+  lastProviderCheckAt DateTime?
+  lastSeenAt          DateTime?
+  metadataFreshness   Float    @default(0)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  artist              Artist   @relation(fields: [artistId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, sourceArtistId])
+  @@index([artistId])
+  @@index([musicBrainzArtistId])
+}
+
+model ArtistSimilarity {
+  id             String   @id @default(uuid()) @db.Uuid
+  sourceArtistId String
+  targetArtistId String
+  providerId     String
+  score          Float
+  confidence     Float    @default(0.5)
+  reason         String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  sourceArtist   Artist   @relation("SimilarityFrom", fields: [sourceArtistId], references: [id], onDelete: Cascade)
+  targetArtist   Artist   @relation("SimilarityTo", fields: [targetArtistId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceArtistId, targetArtistId, providerId])
+  @@index([sourceArtistId])
+  @@index([targetArtistId])
+}
+
+model TrackEdge {
+  id            String   @id @default(uuid()) @db.Uuid
+  sourceTrackId String
+  targetTrackId String?
+  artistId      String?
+  edgeType      String
+  providerId    String?
+  weight        Float    @default(1)
+  confidence    Float    @default(0.5)
+  reason        String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  sourceTrack   CanonicalTrack @relation("TrackEdgeSource", fields: [sourceTrackId], references: [id], onDelete: Cascade)
+  targetTrack   CanonicalTrack? @relation("TrackEdgeTarget", fields: [targetTrackId], references: [id], onDelete: Cascade)
+  artist        Artist?  @relation(fields: [artistId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceTrackId, targetTrackId, artistId, edgeType])
+  @@index([sourceTrackId])
+  @@index([targetTrackId])
+  @@index([artistId])
+  @@index([edgeType])
+}
+
+model DiscoverySeed {
+  id               String   @id @default(uuid()) @db.Uuid
+  scope            String   @default("user")
+  dedupeKey        String?  @unique
+  priority         Int      @default(0)
+  userId           String?  @db.Uuid
+  canonicalTrackId String?
+  artistId         String?
+  legacyTrackId    String?  @db.Uuid
+  reason           String
+  context          Json?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  user             User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  canonicalTrack   CanonicalTrack? @relation(fields: [canonicalTrackId], references: [id], onDelete: Cascade)
+  artist           Artist?  @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  legacyTrack      Track?   @relation(fields: [legacyTrackId], references: [id], onDelete: SetNull)
+  jobs             DiscoveryJob[]
+
+  @@unique([userId, canonicalTrackId, reason])
+  @@index([scope, reason, updatedAt])
+  @@index([dedupeKey])
+  @@index([userId, createdAt])
+  @@index([canonicalTrackId])
+  @@index([artistId])
+}
+
+model DiscoveryJob {
+  id          String             @id @default(uuid()) @db.Uuid
+  seedId      String?            @db.Uuid
+  jobType     String
+  dedupeKey   String?            @unique
+  rateLimitKey String?
+  status      DiscoveryJobStatus @default(PENDING)
+  priority    Int                @default(0)
+  attempts    Int                @default(0)
+  maxAttempts Int                @default(3)
+  providerId  String?
+  payload     Json
+  result      Json?
+  error       String?
+  runAfter    DateTime           @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+  seed        DiscoverySeed?     @relation(fields: [seedId], references: [id], onDelete: Cascade)
+
+  @@index([status, runAfter, priority])
+  @@index([dedupeKey])
+  @@index([rateLimitKey, status, runAfter])
+  @@index([seedId])
+  @@index([jobType])
 }
 
 model Favorite {
@@ -193,6 +450,15 @@ model UserRecommendationEvent {
   id         String                  @id @default(uuid()) @db.Uuid
   userId     String                  @db.Uuid
   trackId    String?                 @db.Uuid
+  artistId   String?
+  sessionId  String?
+  sourceSurface String?
+  position   Int?
+  occurredAt DateTime?
+  recommendationRequestId String?
+  context    Json?
+  reasonSnapshot Json?
+  featuresSnapshot Json?
   eventType  RecommendationEventType
   payload    Json
   createdAt  DateTime                @default(now())

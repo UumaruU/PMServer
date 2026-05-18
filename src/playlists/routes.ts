@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyPluginAsync } from "fastify";
 import { Prisma } from "@prisma/client";
 
+import { discoveryService } from "../discovery/discovery.service";
 import { AppError } from "../utils/errors";
 import {
   ensureSyncTracks,
@@ -293,6 +294,10 @@ export const playlistsRoutes: FastifyPluginAsync = async (app) => {
       throw error;
     }
 
+    void discoveryService.enqueueFromPlaylist(app.prisma, userId, playlistId, trackId).catch((error) => {
+      app.log.warn({ error, userId, playlistId, trackId }, "Failed to enqueue discovery seed from playlist add.");
+    });
+
     const playlist = await getOwnedPlaylist(app, userId, playlistId);
     return { playlist: serializePlaylist(playlist) };
   };
@@ -554,6 +559,23 @@ export const playlistsRoutes: FastifyPluginAsync = async (app) => {
           });
         }
       });
+
+      const syncedPlaylistTracks = await app.prisma.playlistTrack.findMany({
+        where: {
+          playlist: {
+            userId: request.authUser!.userId,
+          },
+        },
+        select: {
+          playlistId: true,
+          trackId: true,
+        },
+      });
+      await Promise.allSettled(
+        syncedPlaylistTracks.map((item) =>
+          discoveryService.enqueueFromPlaylist(app.prisma, request.authUser!.userId, item.playlistId, item.trackId),
+        ),
+      );
 
       return reply.code(204).send();
     },

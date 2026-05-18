@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { Prisma } from "@prisma/client";
 
 import { serializeTrackForClient } from "../tracks/serializers";
+import { discoveryService } from "../discovery/discovery.service";
 import { AppError } from "../utils/errors";
 import { ensureSyncTracks, ensureTrackExists, toExternalTrackId } from "../tracks/service";
 
@@ -77,6 +78,10 @@ export const favoritesRoutes: FastifyPluginAsync = async (app) => {
 
       throw error;
     }
+
+    void discoveryService.enqueueFromFavorite(app.prisma, userId, trackId).catch((error) => {
+      app.log.warn({ error, userId, trackId }, "Failed to enqueue discovery seed from favorite.");
+    });
 
     return { track };
   };
@@ -205,6 +210,10 @@ export const favoritesRoutes: FastifyPluginAsync = async (app) => {
           });
         }
       });
+
+      await Promise.allSettled(
+        desiredTrackIds.map((trackId) => discoveryService.enqueueFromFavorite(app.prisma, request.authUser!.userId, trackId)),
+      );
 
       return reply.code(204).send();
     },

@@ -772,6 +772,8 @@ export interface RecommendationExposureConfig {
   hardHideThreshold: number;
 }
 
+export type RecommendationResurfacingPolicy = "off" | "neutral_only" | "near_miss" | "balanced";
+
 export interface RecommendationConfig {
   canonicalization: CanonicalizationConfig;
   providers: Record<RecommendationProviderId, RecommendationProviderDefinition>;
@@ -798,6 +800,11 @@ export interface RecommendationConfig {
     dislikeHalfLifeMs: number;
   };
   exposure: RecommendationExposureConfig;
+  experiments: {
+    explorationQuota: number;
+    cooldownStrength: number;
+    resurfacingPolicy: RecommendationResurfacingPolicy;
+  };
   filtering: {
     minCanonicalConfidence: number;
   };

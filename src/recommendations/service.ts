@@ -19,6 +19,12 @@ import {
 } from "../recommendation/caching/cacheKeys";
 import { buildRecommendationCatalogSnapshot } from "../recommendation/canonical-graph/snapshotBuilder";
 import { defaultRecommendationConfig } from "../recommendation/config/defaultRecommendationConfig";
+import {
+  mapUnifiedEventTypeToStorageType,
+  normalizeUnifiedRecommendationEvent,
+  type UnifiedRecommendationEvent,
+  type UnifiedRecommendationEventInput,
+} from "../recommendation/events/recommendationEvents";
 import { buildUserRecommendationFeatures } from "../recommendation/user-features/buildUserRecommendationFeatures";
 import type {
   DislikeAffinityEvent,
@@ -35,16 +41,22 @@ import type {
   RecommendationOnboardingProfileInput,
   RecommendationProfiles,
   RecommendationSeed,
+  RecommendationSourceArtist,
   RecommendationSourceProviderMetadata,
+  RecommendationSourceRelease,
   RecommendationSourceTrack,
   RecommendedArtist,
   RecommendedTrack,
   UserRecommendationFeatures,
+  WeightedEdge,
 } from "../recommendation/types";
+import { discoveryService } from "../discovery/discovery.service";
 import { serializeTrackForClient } from "../tracks/serializers";
 import { ensureSyncTrack, ensureSyncTracks, toExternalTrackId } from "../tracks/service";
+import { trackDurationToMilliseconds } from "../tracks/duration";
 
 const NON_PROFILE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const NON_FULL_PLAYABLE_PROVIDER_IDS = new Set(["deezer"]);
 
 const PROVIDER_METADATA: Record<string, RecommendationSourceProviderMetadata> = {
   musicbrainz: {
@@ -83,11 +95,41 @@ const PROVIDER_METADATA: Record<string, RecommendationSourceProviderMetadata> = 
     sourceTrustScore: 0.15,
     popularityPrior: 0.05,
   },
+  lastfm: {
+    providerId: "lastfm",
+    sourcePriority: 45,
+    sourceTrustScore: 0.7,
+    popularityPrior: 0.35,
+  },
+  deezer: {
+    providerId: "deezer",
+    sourcePriority: 55,
+    sourceTrustScore: 0.72,
+    popularityPrior: 0.35,
+  },
+  listenbrainz: {
+    providerId: "listenbrainz",
+    sourcePriority: 48,
+    sourceTrustScore: 0.68,
+    popularityPrior: 0.25,
+  },
 };
 
 type UserStateRecord = Awaited<ReturnType<typeof getUserState>>;
 type RequestContext = Awaited<ReturnType<typeof createRequestContext>>;
 type ResolvedRecommendedTrack = NonNullable<ReturnType<typeof resolveRecommendedTrack>>;
+
+interface RecommendationEventLogDetails {
+  artistId?: string | null;
+  sessionId?: string | null;
+  sourceSurface?: string | null;
+  position?: number | null;
+  occurredAt?: string | Date | null;
+  recommendationRequestId?: string | null;
+  context?: Record<string, unknown> | null;
+  reasonSnapshot?: Record<string, unknown> | null;
+  featuresSnapshot?: Record<string, unknown> | null;
+}
 
 interface PendingWavePayload {
   mode: RecommendationMode;
@@ -121,6 +163,17 @@ function normalizeTimestamp(value: string | Date | null | undefined) {
   return Number.isNaN(date.getTime()) ? "" : date.toISOString();
 }
 
+function createDeterministicHash(value: string) {
+  let hash = 2166136261;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return Math.abs(hash >>> 0).toString(16);
+}
+
 function getProviderId(track: Track) {
   const externalTrackId = toExternalTrackId(track);
   if (externalTrackId.includes(":")) {
@@ -139,6 +192,14 @@ function getProviderTrackId(track: Track) {
   return track.sourceTrackId;
 }
 
+function getRecommendationAudioUrl(providerId: string, audioUrl?: string | null) {
+  if (!audioUrl || NON_FULL_PLAYABLE_PROVIDER_IDS.has(providerId)) {
+    return "";
+  }
+
+  return audioUrl;
+}
+
 function toRecommendationSourceTrack(track: Track, favoriteTrackIds = new Set<string>()): RecommendationSourceTrack {
   const providerId = getProviderId(track);
 
@@ -149,8 +210,8 @@ function toRecommendationSourceTrack(track: Track, favoriteTrackIds = new Set<st
     title: track.title,
     artist: track.artistName,
     coverUrl: track.coverUrl ?? "",
-    audioUrl: track.audioUrl ?? "",
-    duration: track.duration ?? 0,
+    audioUrl: getRecommendationAudioUrl(providerId, track.audioUrl),
+    duration: trackDurationToMilliseconds(track.duration) ?? 0,
     sourceUrl:
       providerId === "hitmos"
         ? "https://rus.hitmotop.com"
@@ -163,6 +224,60 @@ function toRecommendationSourceTrack(track: Track, favoriteTrackIds = new Set<st
     musicBrainzReleaseId: track.musicBrainzReleaseId ?? null,
     sourcePriority: PROVIDER_METADATA[providerId]?.sourcePriority,
     sourceTrustScore: PROVIDER_METADATA[providerId]?.sourceTrustScore,
+  };
+}
+
+function toRecommendationSourceTrackFromIndexedSource(
+  source: Awaited<ReturnType<PrismaClient["trackSource"]["findMany"]>>[number] & {
+    legacyTrack?: Track | null;
+    canonicalTrack?: {
+      id: string;
+      title: string;
+      artistName: string;
+      albumTitle: string | null;
+      coverUrl: string | null;
+      durationMs: number | null;
+      musicBrainzRecordingId: string | null;
+      musicBrainzArtistId: string | null;
+      musicBrainzReleaseId: string | null;
+      musicBrainzReleaseGroupId: string | null;
+      titleFlavor: string[];
+    } | null;
+  },
+  favoriteTrackIds = new Set<string>(),
+): RecommendationSourceTrack {
+  const legacyTrack = source.legacyTrack ?? null;
+  const id = legacyTrack ? toExternalTrackId(legacyTrack) : source.clientTrackId ?? `${source.providerId}:${source.sourceTrackId}`;
+  const duration =
+    source.durationMs ??
+    source.canonicalTrack?.durationMs ??
+    trackDurationToMilliseconds(legacyTrack?.duration) ??
+    0;
+  const audioUrl = getRecommendationAudioUrl(source.providerId, source.audioUrl ?? legacyTrack?.audioUrl ?? "");
+
+  return {
+    id,
+    providerId: source.providerId,
+    providerTrackId: source.sourceTrackId,
+    title: source.title || source.canonicalTrack?.title || legacyTrack?.title || "",
+    artist: source.artistName || source.canonicalTrack?.artistName || legacyTrack?.artistName || "",
+    coverUrl: source.coverUrl ?? source.canonicalTrack?.coverUrl ?? legacyTrack?.coverUrl ?? "",
+    audioUrl,
+    duration,
+    sourceUrl: source.sourceUrl ?? legacyTrack?.audioUrl ?? `https://example.invalid/tracks/${encodeURIComponent(source.sourceTrackId)}`,
+    isFavorite: legacyTrack ? favoriteTrackIds.has(legacyTrack.id) : false,
+    metadataStatus:
+      source.musicBrainzRecordingId || source.musicBrainzArtistId || source.musicBrainzReleaseId ? "enriched" : "raw",
+    albumTitle: source.albumTitle ?? source.canonicalTrack?.albumTitle ?? legacyTrack?.albumTitle ?? undefined,
+    musicBrainzRecordingId: source.musicBrainzRecordingId ?? source.canonicalTrack?.musicBrainzRecordingId ?? null,
+    musicBrainzArtistId: source.musicBrainzArtistId ?? source.canonicalTrack?.musicBrainzArtistId ?? null,
+    musicBrainzReleaseId: source.musicBrainzReleaseId ?? source.canonicalTrack?.musicBrainzReleaseId ?? null,
+    musicBrainzReleaseGroupId:
+      source.musicBrainzReleaseGroupId ?? source.canonicalTrack?.musicBrainzReleaseGroupId ?? null,
+    titleFlavor: source.canonicalTrack?.titleFlavor as RecommendationSourceTrack["titleFlavor"],
+    canonicalId: source.canonicalTrackId,
+    sourcePriority: PROVIDER_METADATA[source.providerId]?.sourcePriority,
+    sourceTrustScore: Math.max(PROVIDER_METADATA[source.providerId]?.sourceTrustScore ?? 0.4, source.qualityScore),
   };
 }
 
@@ -233,6 +348,14 @@ function pickFirstWaveCandidate(
     return null;
   }
 
+  const favoriteArtistIds = new Set([
+    ...context.favoritedTrackIds
+      .map((trackId) => snapshot.tracksById[trackId]?.primaryCanonicalArtistId ?? null)
+      .filter((artistId): artistId is string => !!artistId),
+    ...(context.userFeatures?.topArtists ?? [])
+      .filter((entry) => entry.score >= 8)
+      .map((entry) => entry.id),
+  ]);
   const nonFavoriteCandidate = ranking.find((candidate) => {
     const track = snapshot.tracksById[candidate.canonicalTrackId];
     if (!track) {
@@ -245,6 +368,23 @@ function pickFirstWaveCandidate(
 
     return !isExactFavorite;
   });
+
+  const newArtistCandidate = ranking.find((candidate) => {
+    const track = snapshot.tracksById[candidate.canonicalTrackId];
+    if (!track) {
+      return false;
+    }
+
+    const isExactFavorite =
+      context.favoritedTrackIds.includes(candidate.canonicalTrackId) ||
+      (!!track.preferredVariantId && !!context.userFeatures?.favoriteVariantIds.includes(track.preferredVariantId));
+    const isFavoriteArtist = !!track.primaryCanonicalArtistId && favoriteArtistIds.has(track.primaryCanonicalArtistId);
+    return !isExactFavorite && !isFavoriteArtist;
+  });
+
+  if (newArtistCandidate) {
+    return newArtistCandidate;
+  }
 
   return nonFavoriteCandidate ?? ranking[0];
 }
@@ -520,16 +660,65 @@ function createResultWriter(prisma: PrismaClient, userId: string) {
 }
 
 async function getCatalogSnapshotRevision(prisma: PrismaClient) {
-  const summary = await prisma.track.aggregate({
-    _count: {
-      _all: true,
-    },
-    _max: {
-      updatedAt: true,
-    },
-  });
+  const [legacyTracks, canonicalTracks, trackSources, artists, similarities, edges] = await Promise.all([
+    prisma.track.aggregate({
+      _count: {
+        _all: true,
+      },
+      _max: {
+        updatedAt: true,
+      },
+    }),
+    prisma.canonicalTrack.aggregate({
+      _count: {
+        _all: true,
+      },
+      _max: {
+        updatedAt: true,
+      },
+    }),
+    prisma.trackSource.aggregate({
+      _count: {
+        _all: true,
+      },
+      _max: {
+        updatedAt: true,
+      },
+    }),
+    prisma.artist.aggregate({
+      _count: {
+        _all: true,
+      },
+      _max: {
+        updatedAt: true,
+      },
+    }),
+    prisma.artistSimilarity.aggregate({
+      _count: {
+        _all: true,
+      },
+      _max: {
+        updatedAt: true,
+      },
+    }),
+    prisma.trackEdge.aggregate({
+      _count: {
+        _all: true,
+      },
+      _max: {
+        updatedAt: true,
+      },
+    }),
+  ]);
 
-  return `${summary._count._all}:${summary._max.updatedAt?.toISOString() ?? "none"}`;
+  return [
+    `legacy:${legacyTracks._count._all}:${legacyTracks._max.updatedAt?.toISOString() ?? "none"}`,
+    `canonical:${canonicalTracks._count._all}:${canonicalTracks._max.updatedAt?.toISOString() ?? "none"}`,
+    `sources:${trackSources._count._all}:${trackSources._max.updatedAt?.toISOString() ?? "none"}`,
+    `artists:${artists._count._all}:${artists._max.updatedAt?.toISOString() ?? "none"}`,
+    `similar:${similarities._count._all}:${similarities._max.updatedAt?.toISOString() ?? "none"}`,
+    `edges:${edges._count._all}:${edges._max.updatedAt?.toISOString() ?? "none"}`,
+  ].join("|");
 }
 
 async function buildCatalogSnapshot(prisma: PrismaClient) {
@@ -538,23 +727,150 @@ async function buildCatalogSnapshot(prisma: PrismaClient) {
     return catalogSnapshotCache;
   }
 
-  const tracks = await prisma.track.findMany({
-    orderBy: [
-      {
-        updatedAt: "desc",
+  const [tracks, trackSources, artists, similarities] = await Promise.all([
+    prisma.track.findMany({
+      orderBy: [
+        {
+          updatedAt: "desc",
+        },
+        {
+          id: "asc",
+        },
+      ],
+    }),
+    prisma.trackSource.findMany({
+      where: {
+        indexStatus: {
+          in: ["ACTIVE", "TRUSTED"],
+        },
       },
-      {
-        id: "asc",
+      include: {
+        legacyTrack: true,
+        canonicalTrack: true,
       },
-    ],
-  });
+      orderBy: [
+        {
+          updatedAt: "desc",
+        },
+        {
+          id: "asc",
+        },
+      ],
+    }),
+    prisma.artist.findMany({
+      orderBy: [
+        {
+          updatedAt: "desc",
+        },
+        {
+          id: "asc",
+        },
+      ],
+    }),
+    prisma.artistSimilarity.findMany({
+      include: {
+        sourceArtist: true,
+        targetArtist: true,
+      },
+      orderBy: [
+        {
+          score: "desc",
+        },
+        {
+          id: "asc",
+        },
+      ],
+    }),
+  ]);
   const trackByClientId = new Map(tracks.map((track) => [toExternalTrackId(track), track] as const));
+  trackSources.forEach((source) => {
+    if (!source.legacyTrack) {
+      return;
+    }
+
+    trackByClientId.set(toExternalTrackId(source.legacyTrack), source.legacyTrack);
+    trackByClientId.set(source.clientTrackId ?? `${source.providerId}:${source.sourceTrackId}`, source.legacyTrack);
+  });
+
+  const sourceTracksById = new Map<string, RecommendationSourceTrack>();
+  trackSources.forEach((source) => {
+    const mapped = toRecommendationSourceTrackFromIndexedSource(source);
+    sourceTracksById.set(mapped.id, mapped);
+  });
+  tracks.forEach((track) => {
+    const id = toExternalTrackId(track);
+    if (!sourceTracksById.has(id)) {
+      sourceTracksById.set(id, toRecommendationSourceTrack(track));
+    }
+  });
+
+  const sourceArtists: RecommendationSourceArtist[] = artists.map((artist) => ({
+    id: artist.id,
+    name: artist.name,
+    musicBrainzArtistId: artist.musicBrainzArtistId,
+    type: artist.type ?? undefined,
+    country: artist.country ?? undefined,
+    area: artist.area ?? undefined,
+    tags: artist.tags,
+    imageUrl: artist.imageUrl ?? undefined,
+  }));
+  const releaseById = new Map<string, RecommendationSourceRelease>();
+  trackSources.forEach((source) => {
+    const canonicalTrack = source.canonicalTrack;
+    const releaseKey =
+      canonicalTrack.musicBrainzReleaseId ??
+      (canonicalTrack.albumTitle
+        ? `soft:${createDeterministicHash(`${canonicalTrack.artistName}:${canonicalTrack.albumTitle}`)}`
+        : null);
+    if (!releaseKey) {
+      return;
+    }
+
+    const id = canonicalTrack.musicBrainzReleaseId ? `release:${canonicalTrack.musicBrainzReleaseId}` : `release:${releaseKey}`;
+    const existing = releaseById.get(id);
+    releaseById.set(id, {
+      id,
+      title: canonicalTrack.albumTitle ?? canonicalTrack.title,
+      musicBrainzReleaseId: canonicalTrack.musicBrainzReleaseId,
+      musicBrainzReleaseGroupId: canonicalTrack.musicBrainzReleaseGroupId,
+      artistName: canonicalTrack.artistName,
+      kind: "other",
+      date: canonicalTrack.releaseDate ?? undefined,
+      coverUrl: canonicalTrack.coverUrl ?? undefined,
+      trackTitles: dedupe([...(existing?.trackTitles ?? []), canonicalTrack.title]),
+      trackIds: dedupe([...(existing?.trackIds ?? []), source.clientTrackId ?? `${source.providerId}:${source.sourceTrackId}`]),
+    });
+  });
   const snapshot = buildRecommendationCatalogSnapshot({
-    tracks: tracks.map((track) => toRecommendationSourceTrack(track)),
-    artists: [],
-    releases: [],
+    tracks: [...sourceTracksById.values()],
+    artists: sourceArtists,
+    releases: [...releaseById.values()],
     providerMetadata: PROVIDER_METADATA,
     config: defaultRecommendationConfig,
+  });
+
+  similarities.forEach((similarity) => {
+    const leftId = similarity.sourceArtistId;
+    const rightId = similarity.targetArtistId;
+    if (!snapshot.artistsById[leftId] || !snapshot.artistsById[rightId]) {
+      return;
+    }
+
+    const edge: WeightedEdge = {
+      leftId,
+      rightId,
+      weight: similarity.score,
+      source: similarity.providerId,
+      confidence: similarity.confidence,
+      reason: similarity.reason ?? "provider-similarity",
+    };
+    snapshot.relatedArtists[leftId] = [...(snapshot.relatedArtists[leftId] ?? []), edge]
+      .sort((left, right) => right.weight - left.weight)
+      .slice(0, 24);
+    snapshot.artistsById[leftId].relatedArtistIds = dedupe([
+      ...snapshot.artistsById[leftId].relatedArtistIds,
+      rightId,
+    ]);
   });
 
   catalogSnapshotCache = {
@@ -892,11 +1208,23 @@ async function logRecommendationEvent(
   eventType: RecommendationEventType,
   trackId: string | null,
   payload: unknown,
+  details: RecommendationEventLogDetails = {},
 ) {
   await prisma.userRecommendationEvent.create({
     data: {
       userId,
       trackId,
+      artistId: details.artistId ?? undefined,
+      sessionId: details.sessionId ?? undefined,
+      sourceSurface: details.sourceSurface ?? undefined,
+      position: details.position ?? undefined,
+      occurredAt: details.occurredAt ? new Date(details.occurredAt) : undefined,
+      recommendationRequestId: details.recommendationRequestId ?? undefined,
+      context: details.context === undefined ? undefined : (details.context as Prisma.InputJsonValue),
+      reasonSnapshot:
+        details.reasonSnapshot === undefined ? undefined : (details.reasonSnapshot as Prisma.InputJsonValue),
+      featuresSnapshot:
+        details.featuresSnapshot === undefined ? undefined : (details.featuresSnapshot as Prisma.InputJsonValue),
       eventType,
       payload: payload as Prisma.InputJsonValue,
     },
@@ -911,6 +1239,215 @@ function resolveCanonicalTrackId(snapshot: RecommendationCatalogSnapshot, track:
   );
 }
 
+function getContextNumber(context: Record<string, unknown> | null | undefined, key: string, fallback = 0) {
+  const value = context?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function getContextBoolean(context: Record<string, unknown> | null | undefined, key: string, fallback = false) {
+  const value = context?.[key];
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function getContextString(context: Record<string, unknown> | null | undefined, key: string) {
+  const value = context?.[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function getContextSeedChannels(context: Record<string, unknown> | null | undefined) {
+  const value = context?.seedChannels;
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const channels = value.filter((entry): entry is RecommendationChannel => typeof entry === "string");
+  return channels.length ? channels : undefined;
+}
+
+async function buildRecommendationEventSnapshots(params: {
+  cacheStore: RequestContext["cacheStore"];
+  canonicalTrackId?: string | null;
+  event: Pick<UnifiedRecommendationEvent, "position" | "recommendationRequestId">;
+}) {
+  if (!params.canonicalTrackId) {
+    return {};
+  }
+
+  const cached = await params.cacheStore.getJson<{
+    seed: RecommendationSeed;
+    context: RecommendationContext;
+    results: RecommendedTrack[];
+  }>(RECOMMENDATION_LAST_TRACK_RANKING_KEY);
+  if (!cached?.results?.length) {
+    return {};
+  }
+
+  const result =
+    cached.results.find(
+      (candidate, index) =>
+        candidate.canonicalTrackId === params.canonicalTrackId &&
+        (params.event.position === undefined || params.event.position === index),
+    ) ?? cached.results.find((candidate) => candidate.canonicalTrackId === params.canonicalTrackId);
+
+  if (!result) {
+    return {};
+  }
+
+  return {
+    reasonSnapshot: {
+      recommendationRequestId: params.event.recommendationRequestId ?? null,
+      canonicalTrackId: result.canonicalTrackId,
+      preferredVariantId: result.preferredVariantId,
+      sourceChannels: result.sourceChannels,
+      score: result.score,
+      explanation: result.explanation,
+    },
+    featuresSnapshot: {
+      seed: cached.seed,
+      mode: cached.context.mode,
+      currentCanonicalTrackId: cached.context.currentCanonicalTrackId ?? null,
+      recentRecommendationIds: cached.context.recentRecommendationIds,
+      userFeatures: cached.context.userFeatures ?? null,
+    },
+  };
+}
+
+function buildUnifiedLogDetails(params: {
+  event: UnifiedRecommendationEvent;
+  canonicalTrackId?: string | null;
+  fallbackArtistId?: string | null;
+  snapshots?: {
+    reasonSnapshot?: Record<string, unknown> | null;
+    featuresSnapshot?: Record<string, unknown> | null;
+  };
+}): RecommendationEventLogDetails {
+  return {
+    artistId: params.event.artistId ?? params.fallbackArtistId ?? null,
+    sessionId: params.event.sessionId ?? null,
+    sourceSurface: params.event.sourceSurface ?? null,
+    position: params.event.position ?? null,
+    occurredAt: params.event.timestamp,
+    recommendationRequestId: params.event.recommendationRequestId ?? null,
+    context: {
+      ...(params.event.context ?? {}),
+      canonicalTrackId: params.canonicalTrackId ?? null,
+    },
+    reasonSnapshot: params.snapshots?.reasonSnapshot ?? null,
+    featuresSnapshot: params.snapshots?.featuresSnapshot ?? null,
+  };
+}
+
+async function applyUnifiedRecommendationEvent(
+  prisma: PrismaClient,
+  userId: string,
+  event: UnifiedRecommendationEvent,
+) {
+  const storageEventType = mapUnifiedEventTypeToStorageType(event.type);
+
+  if (!event.trackId) {
+    await logRecommendationEvent(prisma, userId, storageEventType, null, event, buildUnifiedLogDetails({ event }));
+    return;
+  }
+
+  const track = await ensureSyncTrack(prisma, event.trackId);
+  const requestContext = await createRequestContext(prisma, userId);
+  const canonicalTrackId = resolveCanonicalTrackId(requestContext.snapshot, track, event.trackId);
+  const snapshots = await buildRecommendationEventSnapshots({
+    cacheStore: requestContext.cacheStore,
+    canonicalTrackId,
+    event,
+  });
+  const fallbackArtistId = canonicalTrackId
+    ? requestContext.snapshot.tracksById[canonicalTrackId]?.primaryCanonicalArtistId ?? null
+    : null;
+  const logDetails = buildUnifiedLogDetails({
+    event,
+    canonicalTrackId,
+    fallbackArtistId,
+    snapshots,
+  });
+
+  if (!canonicalTrackId) {
+    await logRecommendationEvent(prisma, userId, storageEventType, track.id, event, logDetails);
+    return;
+  }
+
+  if (event.type === "impression") {
+    const impressionEvent: RecommendationImpressionEvent = {
+      requestId: event.recommendationRequestId ?? "unknown",
+      surface: event.sourceSurface ?? "unknown",
+      position: event.position ?? 0,
+      canonicalTrackId,
+      occurredAt: event.timestamp,
+    };
+    await updateProfilesFromImpressions({
+      cacheStore: requestContext.cacheStore,
+      config: defaultRecommendationConfig,
+      events: [impressionEvent],
+    });
+  }
+
+  if (event.type === "play" || event.type === "skip") {
+    const playbackEvent: PlaybackAffinityEvent = {
+      canonicalTrackId,
+      listenedMs: getContextNumber(event.context, "listenedMs"),
+      trackDurationMs: getContextNumber(event.context, "trackDurationMs"),
+      occurredAt: event.timestamp,
+      endedNaturally: getContextBoolean(event.context, "endedNaturally", event.type === "play"),
+      wasSkipped: event.type === "skip" || getContextBoolean(event.context, "wasSkipped"),
+      sessionId: event.sessionId ?? getContextString(event.context, "sessionId") ?? "unknown",
+      seedChannels: getContextSeedChannels(event.context) ?? ["userAffinityRetrieval"],
+    };
+
+    await requestContext.engine.updateAffinityFromPlayback(playbackEvent);
+    await clearPendingWave(requestContext.cacheStore);
+
+    if (playbackEvent.endedNaturally && !playbackEvent.wasSkipped) {
+      await discoveryService.enqueueFromPlayback(prisma, userId, track.id, {
+        listenedMs: playbackEvent.listenedMs,
+        trackDurationMs: playbackEvent.trackDurationMs,
+        occurredAt: playbackEvent.occurredAt,
+        sessionId: playbackEvent.sessionId,
+      });
+    }
+  }
+
+  if (event.type === "like" || event.type === "save") {
+    const favoriteEvent: FavoriteAffinityEvent = {
+      canonicalTrackId,
+      occurredAt: event.timestamp,
+      isFavorite: true,
+    };
+
+    await requestContext.engine.updateAffinityFromFavorite(favoriteEvent);
+    await clearPendingWave(requestContext.cacheStore);
+    await discoveryService.enqueueFromFavorite(prisma, userId, track.id);
+  }
+
+  if (event.type === "add_to_playlist") {
+    const playlistId =
+      getContextString(event.context, "playlistId") ??
+      getContextString(event.context, "playlist_id") ??
+      event.recommendationRequestId ??
+      "recommendation-event";
+    const playlistEvent: PlaylistAffinityEvent = {
+      canonicalTrackId,
+      playlistId,
+      occurredAt: event.timestamp,
+      isAdded: true,
+    };
+
+    await requestContext.engine.updateAffinityFromPlaylist(playlistEvent);
+    await clearPendingWave(requestContext.cacheStore);
+
+    if (playlistId !== "recommendation-event") {
+      await discoveryService.enqueueFromPlaylist(prisma, userId, playlistId, track.id);
+    }
+  }
+
+  await logRecommendationEvent(prisma, userId, storageEventType, track.id, event, logDetails);
+}
+
 export const recommendationService = {
   async getNextRecommendedTrack(
     prisma: PrismaClient,
@@ -923,13 +1460,30 @@ export const recommendationService = {
     },
   ) {
     const requestId = randomUUID();
-    const requestContext = await createRequestContext(prisma, userId);
-    const favoriteTrackIds = new Set(requestContext.userState.favorites.map((favorite) => favorite.trackId));
+    let requestContext = await createRequestContext(prisma, userId);
+    let favoriteTrackIds = new Set(requestContext.userState.favorites.map((favorite) => favorite.trackId));
     const mode = input.mode ?? "autoplay";
-    const context = await buildRecommendationContext(requestContext, {
+    let context = await buildRecommendationContext(requestContext, {
       ...input,
       mode,
     });
+    const discoveryResult = await discoveryService.ensureCandidatePool(prisma, userId, {
+      currentCanonicalTrackId: context.currentCanonicalTrackId,
+      favoritedTrackIds: context.favoritedTrackIds,
+      recentTrackIds: context.recentTrackIds,
+      userFeatures: context.userFeatures,
+    });
+
+    if (discoveryResult.expanded) {
+      catalogSnapshotCache = null;
+      requestContext = await createRequestContext(prisma, userId);
+      favoriteTrackIds = new Set(requestContext.userState.favorites.map((favorite) => favorite.trackId));
+      context = await buildRecommendationContext(requestContext, {
+        ...input,
+        mode,
+      });
+    }
+
     const pending = await getPendingWave(requestContext.cacheStore);
     const pendingAlreadySurfaced =
       !!pending &&
@@ -938,10 +1492,15 @@ export const recommendationService = {
       context.recentRecommendationIds.includes(pending.item.canonicalTrackId);
     let resolved: ResolvedRecommendedTrack | null = null;
     if (pendingAlreadySurfaced) {
-      return null;
+      await clearPendingWave(requestContext.cacheStore);
     }
 
-    if (pending && pending.mode === mode && pending.basisCurrentCanonicalTrackId === context.currentCanonicalTrackId) {
+    if (
+      pending &&
+      !pendingAlreadySurfaced &&
+      pending.mode === mode &&
+      pending.basisCurrentCanonicalTrackId === context.currentCanonicalTrackId
+    ) {
       resolved = pending.item;
     } else {
       const ranking = await requestContext.engine.getRecommendedTracks(
@@ -1000,16 +1559,34 @@ export const recommendationService = {
     },
   ) {
     const requestId = randomUUID();
-    const requestContext = await createRequestContext(prisma, userId);
-    const favoriteTrackIds = new Set(requestContext.userState.favorites.map((favorite) => favorite.trackId));
+    let requestContext = await createRequestContext(prisma, userId);
+    let favoriteTrackIds = new Set(requestContext.userState.favorites.map((favorite) => favorite.trackId));
     const mode = input.mode ?? "autoplay";
     const isWaveMode = true;
-    const context = await buildRecommendationContext(requestContext, {
+    let context = await buildRecommendationContext(requestContext, {
       currentTrackId: input.currentTrackId ?? input.seedTrackId ?? null,
       recentRecommendationTrackIds: input.recentRecommendationTrackIds ?? [],
       skippedTrackIds: [],
       mode,
     });
+    const discoveryResult = await discoveryService.ensureCandidatePool(prisma, userId, {
+      currentCanonicalTrackId: context.currentCanonicalTrackId,
+      favoritedTrackIds: context.favoritedTrackIds,
+      recentTrackIds: context.recentTrackIds,
+      userFeatures: context.userFeatures,
+    });
+
+    if (discoveryResult.expanded) {
+      catalogSnapshotCache = null;
+      requestContext = await createRequestContext(prisma, userId);
+      favoriteTrackIds = new Set(requestContext.userState.favorites.map((favorite) => favorite.trackId));
+      context = await buildRecommendationContext(requestContext, {
+        currentTrackId: input.currentTrackId ?? input.seedTrackId ?? null,
+        recentRecommendationTrackIds: input.recentRecommendationTrackIds ?? [],
+        skippedTrackIds: [],
+        mode,
+      });
+    }
     const excludedIds = new Set(mapTrackIdsToCanonicalIds(requestContext.snapshot, input.excludeTrackIds ?? []));
     const recentCanonicalRecommendationIds = new Set(context.recentRecommendationIds);
     const pending = await getPendingWave(requestContext.cacheStore);
@@ -1019,13 +1596,16 @@ export const recommendationService = {
       pendingMatchesCurrent &&
       (excludedIds.has(pending.item.canonicalTrackId) || recentCanonicalRecommendationIds.has(pending.item.canonicalTrackId));
     const pendingIsReusable = pendingMatchesCurrent && !pendingAlreadySurfaced;
+    if (pendingAlreadySurfaced) {
+      await clearPendingWave(requestContext.cacheStore);
+    }
 
     let items: ResolvedRecommendedTrack[] = [];
     if (pendingIsReusable) {
       items = [pending!.item];
     }
 
-    if (!items.length && !pendingAlreadySurfaced) {
+    if (!items.length) {
       const ranking = await requestContext.engine.getRecommendedTracks(
         {
           mode,
@@ -1061,7 +1641,9 @@ export const recommendationService = {
     return {
       requestId,
       strategy: context.userFeatures?.strategy ?? "user-feed",
-      contextSummary: context.userFeatures?.contextSummary ?? "Личный вкус пользователя",
+      contextSummary:
+        context.userFeatures?.contextSummary ??
+        (discoveryResult.expanded ? "Live discovery expansion found new playable candidates." : "Личный вкус пользователя"),
       seed: {
         mode,
       },
@@ -1088,6 +1670,20 @@ export const recommendationService = {
       ok: true,
       discoveryLevel: input.discoveryLevel ?? "balanced",
     };
+  },
+
+  async recordRecommendationEvents(
+    prisma: PrismaClient,
+    userId: string,
+    input: {
+      events: UnifiedRecommendationEventInput[];
+    },
+  ) {
+    const events = input.events.map((event) => normalizeUnifiedRecommendationEvent(event));
+
+    for (const event of events) {
+      await applyUnifiedRecommendationEvent(prisma, userId, event);
+    }
   },
 
   async recordRecommendationImpressions(
@@ -1241,6 +1837,15 @@ export const recommendationService = {
       ...event,
       trackId: input.trackId,
     });
+
+    if (input.endedNaturally && !input.wasSkipped) {
+      await discoveryService.enqueueFromPlayback(prisma, userId, track.id, {
+        listenedMs: input.listenedMs,
+        trackDurationMs: input.trackDurationMs,
+        occurredAt: input.occurredAt,
+        sessionId: input.sessionId,
+      });
+    }
   },
 
   async updateFavoriteAffinity(
@@ -1272,6 +1877,10 @@ export const recommendationService = {
       ...event,
       trackId: input.trackId,
     });
+
+    if (input.isFavorite) {
+      await discoveryService.enqueueFromFavorite(prisma, userId, track.id);
+    }
   },
 
   async updatePlaylistAffinity(
@@ -1305,6 +1914,10 @@ export const recommendationService = {
       ...event,
       trackId: input.trackId,
     });
+
+    if (input.isAdded) {
+      await discoveryService.enqueueFromPlaylist(prisma, userId, input.playlistId, track.id);
+    }
   },
 
   async updateDislikeAffinity(

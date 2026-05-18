@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
 import { HistoryEventType, Prisma } from "@prisma/client";
 
+import { discoveryService } from "../discovery/discovery.service";
 import { ensureSyncTracks, ensureTrackExists, toExternalTrackId } from "../tracks/service";
 
 const createHistoryBodySchema = {
@@ -98,6 +99,17 @@ export const historyRoutes: FastifyPluginAsync = async (app) => {
         track: true,
       },
     });
+
+    if (body.eventType === HistoryEventType.COMPLETED) {
+      void discoveryService
+        .enqueueFromPlayback(app.prisma, userId, body.trackId, {
+          source: "history_event",
+          playedMs: body.playedMs ?? null,
+        })
+        .catch((error) => {
+          app.log.warn({ error, userId, trackId: body.trackId }, "Failed to enqueue discovery seed from playback history.");
+        });
+    }
 
     return { event };
   };
@@ -251,6 +263,19 @@ export const historyRoutes: FastifyPluginAsync = async (app) => {
         },
       });
 
+      void discoveryService
+        .enqueueFromPlayback(app.prisma, request.authUser!.userId, internalTrack.id, {
+          source: "history_sync_event",
+          playedMs: body.playedMs ?? null,
+          occurredAt: listenedAt.toISOString(),
+        })
+        .catch((error) => {
+          app.log.warn(
+            { error, userId: request.authUser!.userId, trackId: internalTrack.id },
+            "Failed to enqueue discovery seed from synced playback history.",
+          );
+        });
+
       return reply.code(201).send({
         event: {
           id: `${body.trackId}:${buildDayKey(listenedAt)}`,
@@ -343,6 +368,15 @@ export const historyRoutes: FastifyPluginAsync = async (app) => {
           data: createManyData,
         });
       });
+
+      const syncedTrackIds = [...new Set([...trackMap.values()].map((track) => track.id))];
+      await Promise.allSettled(
+        syncedTrackIds.map((trackId) =>
+          discoveryService.enqueueFromPlayback(app.prisma, request.authUser!.userId, trackId, {
+            source: "history_sync",
+          }),
+        ),
+      );
 
       return reply.code(204).send();
     },

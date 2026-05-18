@@ -124,6 +124,11 @@ export const defaultRecommendationConfig: RecommendationConfig = {
     fatiguePenaltyThreshold: 3,
     hardHideThreshold: 5,
   },
+  experiments: {
+    explorationQuota: 0.12,
+    cooldownStrength: 1,
+    resurfacingPolicy: "balanced",
+  },
   filtering: {
     minCanonicalConfidence: 0.55,
   },

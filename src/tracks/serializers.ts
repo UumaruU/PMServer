@@ -5,6 +5,7 @@ import {
   getProviderTrackIdForClientTrack,
   toExternalTrackId,
 } from "./service";
+import { trackDurationToClientSeconds } from "./duration";
 
 const FALLBACK_COVER_URL = "https://placehold.co/300x300?text=Pingu+Music";
 
@@ -20,7 +21,7 @@ export function serializeTrackForClient(track: Track, options: { isFavorite?: bo
     artist: track.artistName,
     coverUrl: track.coverUrl ?? FALLBACK_COVER_URL,
     audioUrl: track.audioUrl ?? "",
-    duration: track.duration ?? 0,
+    duration: trackDurationToClientSeconds(track.duration),
     sourceUrl:
       providerId === "hitmos"
         ? "https://rus.hitmotop.com"
