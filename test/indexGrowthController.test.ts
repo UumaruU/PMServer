@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildIndexGrowthPlan,
   createDiscoveryDedupeKey,
+  IndexGrowthController,
   resolvePoolLevel,
   type CandidatePoolHealth,
   type IndexGrowthThresholds,
@@ -199,5 +200,34 @@ describe("index growth pool health", () => {
         targetId: "global",
       }),
     );
+  });
+
+  it("does not attach missing artist or track targets as foreign keys", async () => {
+    const createdSeeds: Array<Record<string, unknown>> = [];
+    const prisma = {
+      discoverySeed: {
+        findUnique: async () => null,
+        create: async ({ data }: { data: Record<string, unknown> }) => {
+          createdSeeds.push(data);
+          return { id: "seed:1", ...data };
+        },
+      },
+      discoveryJob: {
+        findUnique: async () => null,
+        create: async ({ data }: { data: Record<string, unknown> }) => ({ id: "job:1", ...data }),
+      },
+      artist: {
+        findUnique: async () => null,
+      },
+      canonicalTrack: {
+        findUnique: async () => null,
+      },
+    };
+    const controller = new IndexGrowthController();
+
+    await controller.enqueueGlobalBootstrap(prisma as never, { tags: ["missing-genre"] });
+
+    expect(createdSeeds.length).toBeGreaterThan(0);
+    expect(createdSeeds.every((seed) => seed.artistId === null && seed.canonicalTrackId === null)).toBe(true);
   });
 });

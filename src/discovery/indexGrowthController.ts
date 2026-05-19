@@ -778,6 +778,7 @@ export class IndexGrowthController {
       targetId: seed.targetId,
       reason: seed.reason,
     } as Prisma.InputJsonObject;
+    const foreignKeys = await this.resolveExistingSeedForeignKeys(prisma, seed);
 
     if (existing) {
       return prisma.discoverySeed.update({
@@ -787,6 +788,8 @@ export class IndexGrowthController {
         data: {
           priority: Math.max(existing.priority, seed.priority),
           context,
+          canonicalTrackId: foreignKeys.canonicalTrackId,
+          artistId: foreignKeys.artistId,
         },
       });
     }
@@ -799,10 +802,52 @@ export class IndexGrowthController {
         userId: seed.scope === "user" ? seed.userId ?? null : null,
         reason: getSeedReason(seed.reason),
         context,
-        canonicalTrackId: seed.targetType === "track" ? seed.targetId : null,
-        artistId: seed.targetType === "artist" ? seed.targetId : null,
+        canonicalTrackId: foreignKeys.canonicalTrackId,
+        artistId: foreignKeys.artistId,
       },
     });
+  }
+
+  private async resolveExistingSeedForeignKeys(
+    prisma: PrismaClient,
+    seed: IndexGrowthSeedSpec,
+  ): Promise<{ canonicalTrackId: string | null; artistId: string | null }> {
+    if (seed.targetType === "track") {
+      const track = await prisma.canonicalTrack.findUnique({
+        where: {
+          id: seed.targetId,
+        },
+        select: {
+          id: true,
+        },
+      });
+
+      return {
+        canonicalTrackId: track?.id ?? null,
+        artistId: null,
+      };
+    }
+
+    if (seed.targetType === "artist") {
+      const artist = await prisma.artist.findUnique({
+        where: {
+          id: seed.targetId,
+        },
+        select: {
+          id: true,
+        },
+      });
+
+      return {
+        canonicalTrackId: null,
+        artistId: artist?.id ?? null,
+      };
+    }
+
+    return {
+      canonicalTrackId: null,
+      artistId: null,
+    };
   }
 
   private async enqueueJobsForSeed(
