@@ -4,6 +4,7 @@ import fastifyJwt from "@fastify/jwt";
 import fastifyRateLimit from "@fastify/rate-limit";
 import { Prisma } from "@prisma/client";
 
+import { adminRoutes } from "./admin/routes";
 import { authRoutes } from "./auth/routes";
 import type { AppConfig } from "./config";
 import { loadConfig } from "./config";
@@ -54,7 +55,7 @@ export const buildApp = async (options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(fastifyCors, {
     origin: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Authorization", "Content-Type"],
+    allowedHeaders: ["Authorization", "Content-Type", "X-Admin-Token"],
   });
 
   await app.register(fastifyJwt, {
@@ -76,6 +77,7 @@ export const buildApp = async (options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(searchHistoryRoutes);
   await app.register(tracksRoutes);
   await app.register(recommendationsRoutes);
+  await app.register(adminRoutes);
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof AppError) {

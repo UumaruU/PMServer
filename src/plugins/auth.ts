@@ -34,4 +34,13 @@ export const registerAuthDecorator = (app: FastifyInstance): void => {
       throw new AppError(401, "UNAUTHORIZED", "Invalid or missing access token.");
     }
   });
+  app.decorate("requireAdmin", async (request) => {
+    const configuredToken = app.config.adminApiToken;
+    const providedToken = request.headers["x-admin-token"];
+    const token = Array.isArray(providedToken) ? providedToken[0] : providedToken;
+
+    if (!configuredToken || token !== configuredToken) {
+      throw new AppError(403, "FORBIDDEN", "Admin access is required.");
+    }
+  });
 };

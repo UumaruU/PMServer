@@ -91,7 +91,8 @@ All `/me/*` routes and `GET /auth/me` require `Authorization: Bearer <accessToke
 
 ## Tests
 
-Integration tests use `Fastify.inject` and a PostgreSQL database from `TEST_DATABASE_URL` or `DATABASE_URL`.
+Integration tests use `Fastify.inject` and require a dedicated PostgreSQL database from `TEST_DATABASE_URL`.
+The database name must include `test`; the suite deletes rows between tests and is skipped otherwise.
 
 ```bash
 npm test
@@ -103,11 +104,10 @@ Recommended local flow:
 $env:TEST_DATABASE_URL="postgresql://postgres:postgres@localhost:5432/pingu_music_test"
 $env:JWT_ACCESS_SECRET="test-access-secret"
 $env:JWT_REFRESH_SECRET="test-refresh-secret"
-$env:DATABASE_URL=$env:TEST_DATABASE_URL
 npx prisma migrate deploy
 npm test
 ```
 
 Create the `pingu_music_test` database in PostgreSQL before running the test flow.
 
-If neither database URL is configured, the integration suite is skipped.
+If `TEST_DATABASE_URL` is not configured, the integration suite is skipped.

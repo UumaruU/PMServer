@@ -21,6 +21,7 @@ export type AppConfig = {
   discoveryMaxJobsPerTick: number;
   discoveryBackfillOnStartup: boolean;
   discoveryBackfillBatchSize: number;
+  adminApiToken: string | null;
 };
 
 const getRequiredEnv = (name: string): string => {
@@ -77,4 +78,5 @@ export const loadConfig = (): AppConfig => ({
   discoveryMaxJobsPerTick: getNumberEnv("DISCOVERY_MAX_JOBS_PER_TICK", 3),
   discoveryBackfillOnStartup: getBooleanEnv("DISCOVERY_BACKFILL_ON_STARTUP", true),
   discoveryBackfillBatchSize: getNumberEnv("DISCOVERY_BACKFILL_BATCH_SIZE", 200),
+  adminApiToken: process.env.ADMIN_API_TOKEN ?? null,
 });

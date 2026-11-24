@@ -635,6 +635,8 @@ export const discoveryService = {
       health: result.health,
       queuedJobs: result.queuedJobs,
       ingestedTrackIds: result.liveExpansion?.ingestedTrackIds ?? [],
+      liveExpansion: result.liveExpansion,
+      plan: result.plan,
     };
   },
 

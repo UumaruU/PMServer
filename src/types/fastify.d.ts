@@ -15,6 +15,7 @@ declare module "fastify" {
     config: AppConfig;
     prisma: PrismaClient;
     authenticate: preHandlerHookHandler;
+    requireAdmin: preHandlerHookHandler;
   }
 }
 

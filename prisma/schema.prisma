@@ -75,6 +75,7 @@ model User {
   recommendationProfile  UserRecommendationProfile?
   recommendationCache    UserRecommendationCacheEntry[]
   recommendationEvents   UserRecommendationEvent[]
+  recommendationRequests RecommendationRequest[]
   discoverySeeds         DiscoverySeed[]
 }
 
@@ -467,4 +468,209 @@ model UserRecommendationEvent {
 
   @@index([userId, createdAt])
   @@index([trackId])
+}
+
+model RecommendationRequest {
+  id                        String                            @id @default(uuid()) @db.Uuid
+  userId                    String                            @db.Uuid
+  surface                   String
+  mode                      String?
+  strategy                  String?
+  contextSummary            String?
+  seed                      Json?
+  input                     Json?
+  userProfileSnapshot       Json?
+  userFeatureSnapshot       Json?
+  contextSnapshot           Json?
+  poolHealthSnapshot        Json?
+  candidateGeneratorSummary Json?
+  expansionSummary          Json?
+  finalRecommendations      Json?
+  sampled                   Boolean                           @default(true)
+  sampleRate                Float                             @default(1)
+  compact                   Boolean                           @default(true)
+  status                    String                            @default("completed")
+  error                     String?
+  expiresAt                 DateTime?
+  completedAt               DateTime?
+  createdAt                 DateTime                          @default(now())
+  updatedAt                 DateTime                          @updatedAt
+  user                      User                              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  candidateSnapshots        RecommendationCandidateSnapshot[]
+  featureSnapshots          RecommendationFeatureSnapshot[]
+  reasonSnapshots           RecommendationReasonSnapshot[]
+  filterLogs                RecommendationFilterLog[]
+  scoreBreakdowns           RecommendationScoreBreakdown[]
+  poolHealthSnapshots       PoolHealthSnapshot[]
+  discoveryJobLogs          DiscoveryJobLog[]
+  providerResultLogs        ProviderResultLog[]
+  graphEdgeAudits           GraphEdgeAudit[]
+
+  @@index([userId, createdAt])
+  @@index([surface, createdAt])
+  @@index([expiresAt])
+}
+
+model RecommendationCandidateSnapshot {
+  id                      String                @id @default(uuid()) @db.Uuid
+  recommendationRequestId String                @db.Uuid
+  canonicalTrackId        String?
+  preferredVariantId      String?
+  stage                   String
+  rank                    Int?
+  score                   Float?
+  sourceChannels          String[]              @default([])
+  sourceSummary           Json?
+  reasonSummary           Json?
+  trackSnapshot           Json?
+  isFinal                 Boolean               @default(false)
+  createdAt               DateTime              @default(now())
+  request                 RecommendationRequest @relation(fields: [recommendationRequestId], references: [id], onDelete: Cascade)
+
+  @@index([recommendationRequestId, stage])
+  @@index([canonicalTrackId])
+}
+
+model RecommendationFeatureSnapshot {
+  id                      String                @id @default(uuid()) @db.Uuid
+  recommendationRequestId String                @db.Uuid
+  canonicalTrackId        String?
+  entityType              String
+  entityId                String?
+  features                Json
+  createdAt               DateTime              @default(now())
+  request                 RecommendationRequest @relation(fields: [recommendationRequestId], references: [id], onDelete: Cascade)
+
+  @@index([recommendationRequestId, entityType])
+  @@index([entityType, entityId])
+  @@index([canonicalTrackId])
+}
+
+model RecommendationReasonSnapshot {
+  id                      String                @id @default(uuid()) @db.Uuid
+  recommendationRequestId String                @db.Uuid
+  canonicalTrackId        String?
+  candidateSnapshotId     String?               @db.Uuid
+  reasonType              String
+  reasons                 Json
+  createdAt               DateTime              @default(now())
+  request                 RecommendationRequest @relation(fields: [recommendationRequestId], references: [id], onDelete: Cascade)
+
+  @@index([recommendationRequestId, reasonType])
+  @@index([canonicalTrackId])
+  @@index([candidateSnapshotId])
+}
+
+model RecommendationFilterLog {
+  id                      String                @id @default(uuid()) @db.Uuid
+  recommendationRequestId String                @db.Uuid
+  canonicalTrackId        String?
+  stage                   String
+  reason                  String
+  score                   Float?
+  details                 Json?
+  createdAt               DateTime              @default(now())
+  request                 RecommendationRequest @relation(fields: [recommendationRequestId], references: [id], onDelete: Cascade)
+
+  @@index([recommendationRequestId, reason])
+  @@index([canonicalTrackId])
+}
+
+model RecommendationScoreBreakdown {
+  id                      String                @id @default(uuid()) @db.Uuid
+  recommendationRequestId String                @db.Uuid
+  canonicalTrackId        String?
+  rank                    Int?
+  finalScore              Float
+  components              Json
+  penalties               Json?
+  createdAt               DateTime              @default(now())
+  request                 RecommendationRequest @relation(fields: [recommendationRequestId], references: [id], onDelete: Cascade)
+
+  @@index([recommendationRequestId, rank])
+  @@index([canonicalTrackId])
+}
+
+model PoolHealthSnapshot {
+  id                      String                @id @default(uuid()) @db.Uuid
+  recommendationRequestId String                @db.Uuid
+  userId                  String?               @db.Uuid
+  poolLevel               String
+  health                  Json
+  plan                    Json?
+  queuedJobs              Int?
+  liveExpansion           Json?
+  createdAt               DateTime              @default(now())
+  request                 RecommendationRequest @relation(fields: [recommendationRequestId], references: [id], onDelete: Cascade)
+
+  @@index([recommendationRequestId])
+  @@index([userId, createdAt])
+  @@index([poolLevel, createdAt])
+}
+
+model DiscoveryJobLog {
+  id                      String                @id @default(uuid()) @db.Uuid
+  recommendationRequestId String?               @db.Uuid
+  discoveryJobId          String?               @db.Uuid
+  seedId                  String?               @db.Uuid
+  action                  String
+  jobType                 String?
+  status                  String
+  providerId              String?
+  providerCallCount       Int?
+  payload                 Json?
+  resultSummary           Json?
+  rawPayload              Json?
+  rawPayloadBytes         Int?
+  rawPayloadExpiresAt     DateTime?
+  createdAt               DateTime              @default(now())
+  request                 RecommendationRequest? @relation(fields: [recommendationRequestId], references: [id], onDelete: Cascade)
+
+  @@index([recommendationRequestId])
+  @@index([discoveryJobId])
+  @@index([status, createdAt])
+  @@index([rawPayloadExpiresAt])
+}
+
+model ProviderResultLog {
+  id                      String                @id @default(uuid()) @db.Uuid
+  recommendationRequestId String?               @db.Uuid
+  providerId              String
+  operation               String?
+  entityType              String?
+  entityId                String?
+  status                  String
+  summary                 Json?
+  rawPayload              Json?
+  rawPayloadBytes         Int?
+  rawPayloadExpiresAt     DateTime?
+  createdAt               DateTime              @default(now())
+  request                 RecommendationRequest? @relation(fields: [recommendationRequestId], references: [id], onDelete: Cascade)
+
+  @@index([recommendationRequestId])
+  @@index([providerId, operation, createdAt])
+  @@index([entityType, entityId])
+  @@index([rawPayloadExpiresAt])
+}
+
+model GraphEdgeAudit {
+  id                      String                @id @default(uuid()) @db.Uuid
+  recommendationRequestId String?               @db.Uuid
+  candidateTrackId        String?
+  sourceNodeType          String
+  sourceNodeId            String
+  targetNodeType          String
+  targetNodeId            String
+  edgeType                String
+  weight                  Float?
+  confidence              Float?
+  reason                  String?
+  evidence                Json?
+  createdAt               DateTime              @default(now())
+  request                 RecommendationRequest? @relation(fields: [recommendationRequestId], references: [id], onDelete: Cascade)
+
+  @@index([recommendationRequestId, edgeType])
+  @@index([candidateTrackId])
+  @@index([sourceNodeType, sourceNodeId])
+  @@index([targetNodeType, targetNodeId])
 }

@@ -55,6 +55,7 @@ describeIfDb("Pingu Music API", () => {
     discoveryMaxJobsPerTick: 3,
     discoveryBackfillOnStartup: false,
     discoveryBackfillBatchSize: 200,
+    adminApiToken: "test-admin-token",
   };
 
   let app: Awaited<ReturnType<typeof buildApp>>;
@@ -78,6 +79,7 @@ describeIfDb("Pingu Music API", () => {
     await prisma.trackSource.deleteMany();
     await prisma.artist.deleteMany();
     await prisma.canonicalTrack.deleteMany();
+    await prisma.recommendationRequest.deleteMany();
     await prisma.userRecommendationEvent.deleteMany();
     await prisma.userRecommendationCacheEntry.deleteMany();
     await prisma.userRecommendationProfile.deleteMany();
@@ -888,6 +890,7 @@ describeIfDb("Pingu Music API", () => {
     expect(stream.statusCode).toBe(200);
 
     const streamBody = stream.json() as {
+      requestId: string;
       items: Array<{
         preferredVariantId: string;
         track: { id: string; audioUrl: string };
@@ -896,6 +899,39 @@ describeIfDb("Pingu Music API", () => {
     expect(streamBody.items.length).toBeGreaterThan(0);
     expect(streamBody.items[0].track.id).toBe(streamBody.items[0].preferredVariantId);
     expect(streamBody.items[0].track.audioUrl).toContain("https://");
+    const auditRequest = await prisma.recommendationRequest.findUnique({
+      where: {
+        id: streamBody.requestId,
+      },
+    });
+    expect(auditRequest).toMatchObject({
+      id: streamBody.requestId,
+      userId: body.user.id,
+      surface: "stream",
+      mode: "autoplay",
+      sampled: true,
+    });
+    expect(
+      await prisma.recommendationCandidateSnapshot.count({
+        where: {
+          recommendationRequestId: streamBody.requestId,
+        },
+      }),
+    ).toBeGreaterThan(0);
+    expect(
+      await prisma.recommendationScoreBreakdown.count({
+        where: {
+          recommendationRequestId: streamBody.requestId,
+        },
+      }),
+    ).toBeGreaterThan(0);
+    expect(
+      await prisma.poolHealthSnapshot.count({
+        where: {
+          recommendationRequestId: streamBody.requestId,
+        },
+      }),
+    ).toBe(1);
 
     const playback = await app.inject({
       method: "POST",

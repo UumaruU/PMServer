@@ -10,6 +10,13 @@ import {
   updateProfilesFromInteraction,
 } from "../recommendation/affinity/profileStore";
 import {
+  loadRecommendationAuditConfig,
+  persistRecommendationAuditTrace,
+  shouldSampleRecommendationAudit,
+  type RecommendationAuditDiscoveryResult,
+  type RecommendationAuditTrace,
+} from "../recommendation/audit/recommendationAudit";
+import {
   RECOMMENDATION_LAST_ARTIST_RANKING_KEY,
   RECOMMENDATION_LAST_TRACK_RANKING_KEY,
   RECOMMENDATION_LAST_TRACK_RESULT_KEY,
@@ -25,6 +32,7 @@ import {
   type UnifiedRecommendationEvent,
   type UnifiedRecommendationEventInput,
 } from "../recommendation/events/recommendationEvents";
+import { getRankedTrackRecommendationTrace } from "../recommendation/next-track/getNextRecommendedTrack";
 import { buildUserRecommendationFeatures } from "../recommendation/user-features/buildUserRecommendationFeatures";
 import type {
   DislikeAffinityEvent,
@@ -118,6 +126,7 @@ const PROVIDER_METADATA: Record<string, RecommendationSourceProviderMetadata> = 
 type UserStateRecord = Awaited<ReturnType<typeof getUserState>>;
 type RequestContext = Awaited<ReturnType<typeof createRequestContext>>;
 type ResolvedRecommendedTrack = NonNullable<ReturnType<typeof resolveRecommendedTrack>>;
+type CandidatePoolResult = Awaited<ReturnType<typeof discoveryService.ensureCandidatePool>>;
 
 interface RecommendationEventLogDetails {
   artistId?: string | null;
@@ -1202,6 +1211,69 @@ function resolveRecommendedTrack(
   };
 }
 
+function buildTrackRecommendationTraceForAudit(params: {
+  requestContext: RequestContext;
+  seed: RecommendationSeed;
+  context: RecommendationContext;
+}): RecommendationAuditTrace | null {
+  try {
+    return getRankedTrackRecommendationTrace({
+      seed: params.seed,
+      context: params.context,
+      snapshot: params.requestContext.snapshot,
+      profiles: params.requestContext.profiles,
+      config: defaultRecommendationConfig,
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function persistRecommendationRequestAudit(params: {
+  prisma: PrismaClient;
+  userId: string;
+  requestId: string;
+  surface: string;
+  mode: RecommendationMode;
+  seed: RecommendationSeed;
+  input: Record<string, unknown>;
+  requestContext: RequestContext;
+  context: RecommendationContext;
+  discoveryResult: CandidatePoolResult | null;
+  finalRecommendations: unknown[];
+  buildTrace: boolean;
+}) {
+  const config = loadRecommendationAuditConfig();
+  if (!shouldSampleRecommendationAudit(params.requestId, config)) {
+    return;
+  }
+
+  const trace = params.buildTrace
+    ? buildTrackRecommendationTraceForAudit({
+        requestContext: params.requestContext,
+        seed: params.seed,
+        context: params.context,
+      })
+    : null;
+
+  await persistRecommendationAuditTrace(params.prisma, {
+    requestId: params.requestId,
+    userId: params.userId,
+    surface: params.surface,
+    mode: params.mode,
+    seed: params.seed,
+    input: params.input,
+    strategy: params.context.userFeatures?.strategy ?? null,
+    contextSummary: params.context.userFeatures?.contextSummary ?? null,
+    context: params.context,
+    profiles: params.requestContext.profiles,
+    discoveryResult: params.discoveryResult as RecommendationAuditDiscoveryResult | null,
+    trace,
+    finalRecommendations: params.finalRecommendations,
+    config,
+  });
+}
+
 async function logRecommendationEvent(
   prisma: PrismaClient,
   userId: string,
@@ -1491,6 +1563,11 @@ export const recommendationService = {
       pending.basisCurrentCanonicalTrackId === context.currentCanonicalTrackId &&
       context.recentRecommendationIds.includes(pending.item.canonicalTrackId);
     let resolved: ResolvedRecommendedTrack | null = null;
+    let generatedFreshRanking = false;
+    const seed: RecommendationSeed = {
+      mode,
+      canonicalTrackId: context.currentCanonicalTrackId ?? undefined,
+    };
     if (pendingAlreadySurfaced) {
       await clearPendingWave(requestContext.cacheStore);
     }
@@ -1503,22 +1580,45 @@ export const recommendationService = {
     ) {
       resolved = pending.item;
     } else {
-      const ranking = await requestContext.engine.getRecommendedTracks(
-        {
-          mode,
-          canonicalTrackId: context.currentCanonicalTrackId ?? undefined,
-        },
-        context,
-      );
+      generatedFreshRanking = true;
+      const ranking = await requestContext.engine.getRecommendedTracks(seed, context);
       const selected = pickFirstWaveCandidate(ranking, context, requestContext.snapshot);
       if (!selected) {
         await clearPendingWave(requestContext.cacheStore);
+        await persistRecommendationRequestAudit({
+          prisma,
+          userId,
+          requestId,
+          surface: "next-track",
+          mode,
+          seed,
+          input: input as Record<string, unknown>,
+          requestContext,
+          context,
+          discoveryResult,
+          finalRecommendations: [],
+          buildTrace: generatedFreshRanking,
+        });
         return null;
       }
 
       resolved = resolveRecommendedTrack(selected, favoriteTrackIds, requestContext.trackByClientId);
       if (!resolved) {
         await clearPendingWave(requestContext.cacheStore);
+        await persistRecommendationRequestAudit({
+          prisma,
+          userId,
+          requestId,
+          surface: "next-track",
+          mode,
+          seed,
+          input: input as Record<string, unknown>,
+          requestContext,
+          context,
+          discoveryResult,
+          finalRecommendations: [],
+          buildTrace: generatedFreshRanking,
+        });
         return null;
       }
 
@@ -1534,7 +1634,7 @@ export const recommendationService = {
       });
     }
 
-    return {
+    const response = {
       requestId,
       strategy: context.userFeatures?.strategy ?? "user-feed",
       contextSummary: context.userFeatures?.contextSummary ?? "Личный вкус пользователя",
@@ -1544,6 +1644,23 @@ export const recommendationService = {
       seedLabel: buildSeedLabel(requestContext.snapshot, null),
       ...resolved!,
     };
+
+    await persistRecommendationRequestAudit({
+      prisma,
+      userId,
+      requestId,
+      surface: "next-track",
+      mode,
+      seed,
+      input: input as Record<string, unknown>,
+      requestContext,
+      context,
+      discoveryResult,
+      finalRecommendations: [response],
+      buildTrace: generatedFreshRanking,
+    });
+
+    return response;
   },
 
   async getRecommendationStreamBatch(
@@ -1596,6 +1713,11 @@ export const recommendationService = {
       pendingMatchesCurrent &&
       (excludedIds.has(pending.item.canonicalTrackId) || recentCanonicalRecommendationIds.has(pending.item.canonicalTrackId));
     const pendingIsReusable = pendingMatchesCurrent && !pendingAlreadySurfaced;
+    const seed: RecommendationSeed = {
+      mode,
+      canonicalTrackId: context.currentCanonicalTrackId ?? undefined,
+    };
+    let generatedFreshRanking = false;
     if (pendingAlreadySurfaced) {
       await clearPendingWave(requestContext.cacheStore);
     }
@@ -1606,13 +1728,8 @@ export const recommendationService = {
     }
 
     if (!items.length) {
-      const ranking = await requestContext.engine.getRecommendedTracks(
-        {
-          mode,
-          canonicalTrackId: context.currentCanonicalTrackId ?? undefined,
-        },
-        context,
-      );
+      generatedFreshRanking = true;
+      const ranking = await requestContext.engine.getRecommendedTracks(seed, context);
       const selected = pickFirstWaveCandidate(
         ranking.filter((track) => !excludedIds.has(track.canonicalTrackId) && !recentCanonicalRecommendationIds.has(track.canonicalTrackId)),
         context,
@@ -1638,7 +1755,7 @@ export const recommendationService = {
       }
     }
 
-    return {
+    const response = {
       requestId,
       strategy: context.userFeatures?.strategy ?? "user-feed",
       contextSummary:
@@ -1652,6 +1769,23 @@ export const recommendationService = {
       visibleQueueLength: items.length,
       items,
     };
+
+    await persistRecommendationRequestAudit({
+      prisma,
+      userId,
+      requestId,
+      surface: "stream",
+      mode,
+      seed,
+      input: input as Record<string, unknown>,
+      requestContext,
+      context,
+      discoveryResult,
+      finalRecommendations: response.items,
+      buildTrace: generatedFreshRanking,
+    });
+
+    return response;
   },
 
   async saveOnboardingProfile(
